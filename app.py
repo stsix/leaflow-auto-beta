@@ -684,7 +684,7 @@ def manual_checkin(account_id):
         logger.error(f"Manual checkin error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template (keep your existing template, it looks good)
+# HTML Template
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -765,6 +765,10 @@ HTML_TEMPLATE = '''
             transform: translateY(-2px);
             box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
         }
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
         .btn-full { width: 100%; }
         .btn-sm { 
             padding: 8px 16px; 
@@ -819,27 +823,6 @@ HTML_TEMPLATE = '''
             display: flex;
             gap: 10px;
             align-items: center;
-        }
-        
-        /* Language Switcher */
-        .lang-switcher {
-            display: flex;
-            background: #f0f0f0;
-            border-radius: 6px;
-            overflow: hidden;
-        }
-        .lang-btn {
-            padding: 8px 16px;
-            background: transparent;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-            transition: all 0.3s;
-        }
-        .lang-btn.active {
-            background: white;
-            color: #667eea;
-            font-weight: 600;
         }
         
         /* Stats Grid */
@@ -945,10 +928,6 @@ HTML_TEMPLATE = '''
         .badge-danger { 
             background: #fed7d7; 
             color: #742a2a; 
-        }
-        .badge-warning { 
-            background: #feebc8; 
-            color: #744210; 
         }
         
         /* Switch Styles */
@@ -1056,116 +1035,6 @@ HTML_TEMPLATE = '''
             color: #4a5568;
         }
         
-        /* Form Row */
-        .form-row { 
-            display: grid; 
-            grid-template-columns: 1fr 1fr; 
-            gap: 15px; 
-        }
-        
-        /* Cookie format hint */
-        .format-hint {
-            background: #f7fafc;
-            border-left: 3px solid #667eea;
-            padding: 12px;
-            margin-top: 10px;
-            border-radius: 6px;
-            font-size: 13px;
-            color: #4a5568;
-        }
-        .format-hint code {
-            background: #e2e8f0;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-        }
-        
-        /* Action Buttons Container */
-        .action-buttons {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-        
-        /* Responsive Design */
-        @media (max-width: 768px) {
-            .login-box {
-                padding: 30px 20px;
-            }
-            
-            .dashboard {
-                padding: 15px;
-            }
-            
-            .header {
-                padding: 20px;
-            }
-            
-            .header h1 {
-                font-size: 20px;
-            }
-            
-            .stats-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .section {
-                padding: 20px;
-            }
-            
-            .section h2 {
-                font-size: 18px;
-            }
-            
-            .table {
-                font-size: 14px;
-            }
-            
-            .table th, .table td {
-                padding: 10px 8px;
-            }
-            
-            .form-row {
-                grid-template-columns: 1fr;
-            }
-            
-            .modal-content {
-                padding: 20px;
-            }
-            
-            .action-buttons {
-                flex-direction: column;
-            }
-            
-            .action-buttons .btn {
-                width: 100%;
-            }
-            
-            /* Hide less important columns on mobile */
-            .hide-mobile {
-                display: none;
-            }
-        }
-        
-        @media (max-width: 480px) {
-            .header-content {
-                flex-direction: column;
-                align-items: stretch;
-            }
-            
-            .header-actions {
-                justify-content: space-between;
-            }
-            
-            .stat-card {
-                padding: 20px;
-            }
-            
-            .stat-card .value {
-                font-size: 28px;
-            }
-        }
-        
         /* Loading Spinner */
         .spinner {
             border: 3px solid #f3f3f3;
@@ -1219,208 +1088,36 @@ HTML_TEMPLATE = '''
         .toast.info {
             border-left: 4px solid #4299e1;
         }
+        
+        /* Error message */
+        .error-message {
+            color: #e53e3e;
+            font-size: 14px;
+            margin-top: 10px;
+            display: none;
+        }
     </style>
 </head>
 <body>
-    <!-- Language Data -->
-    <script>
-        const translations = {
-            zh: {
-                login: {
-                    title: '🔐 管理员登录',
-                    username: '用户名',
-                    password: '密码',
-                    button: '登录',
-                    error: '登录失败'
-                },
-                dashboard: {
-                    title: '📊 LeafLow 自动签到控制面板',
-                    logout: '退出',
-                    stats: {
-                        totalAccounts: '账号总数',
-                        activeAccounts: '活跃账号',
-                        totalCheckins: '签到总数',
-                        successRate: '成功率'
-                    },
-                    todayCheckins: {
-                        title: '📅 今日签到记录',
-                        account: '账号',
-                        status: '状态',
-                        message: '消息',
-                        time: '时间',
-                        success: '成功',
-                        failed: '失败'
-                    },
-                    accounts: {
-                        title: '👥 账号管理',
-                        addButton: '+ 添加账号',
-                        name: '名称',
-                        status: '状态',
-                        checkinTime: '签到时间',
-                        actions: '操作',
-                        checkinNow: '立即签到',
-                        delete: '删除',
-                        confirmDelete: '确定删除此账号吗？',
-                        confirmCheckin: '确定立即执行签到吗？'
-                    },
-                    notifications: {
-                        title: '🔔 通知设置',
-                        enable: '启用通知',
-                        telegramBot: 'Telegram Bot Token',
-                        telegramUser: 'Telegram User ID',
-                        wechatKey: '企业微信 Webhook Key',
-                        save: '保存设置'
-                    }
-                },
-                modal: {
-                    addAccount: '添加新账号',
-                    accountName: '账号名称',
-                    checkinTime: '签到时间',
-                    cookieData: 'Cookie 数据',
-                    cookieHint: '支持两种格式：',
-                    format1: '1. JSON格式：{"cookies": {"key": "value"}}',
-                    format2: '2. 字符串格式：key1=value1; key2=value2',
-                    addButton: '添加账号',
-                    cancel: '取消'
-                },
-                messages: {
-                    loginSuccess: '登录成功',
-                    loginFailed: '用户名或密码错误',
-                    accountAdded: '账号添加成功',
-                    accountDeleted: '账号删除成功',
-                    settingsSaved: '设置保存成功',
-                    checkinTriggered: '签到任务已触发',
-                    invalidFormat: '格式无效',
-                    error: '操作失败'
-                }
-            },
-            en: {
-                login: {
-                    title: '🔐 Admin Login',
-                    username: 'Username',
-                    password: 'Password',
-                    button: 'Login',
-                    error: 'Login failed'
-                },
-                dashboard: {
-                    title: '📊 LeafLow Auto Check-in Panel',
-                    logout: 'Logout',
-                    stats: {
-                        totalAccounts: 'Total Accounts',
-                        activeAccounts: 'Active Accounts',
-                        totalCheckins: 'Total Check-ins',
-                        successRate: 'Success Rate'
-                    },
-                    todayCheckins: {
-                        title: '📅 Today\'s Check-ins',
-                        account: 'Account',
-                        status: 'Status',
-                        message: 'Message',
-                        time: 'Time',
-                        success: 'Success',
-                        failed: 'Failed'
-                    },
-                    accounts: {
-                        title: '👥 Account Management',
-                        addButton: '+ Add Account',
-                        name: 'Name',
-                        status: 'Status',
-                        checkinTime: 'Check-in Time',
-                        actions: 'Actions',
-                        checkinNow: 'Check-in Now',
-                        delete: 'Delete',
-                        confirmDelete: 'Delete this account?',
-                        confirmCheckin: 'Perform check-in now?'
-                    },
-                    notifications: {
-                        title: '🔔 Notification Settings',
-                        enable: 'Enable Notifications',
-                        telegramBot: 'Telegram Bot Token',
-                        telegramUser: 'Telegram User ID',
-                        wechatKey: 'WeChat Webhook Key',
-                        save: 'Save Settings'
-                    }
-                },
-                modal: {
-                    addAccount: 'Add New Account',
-                    accountName: 'Account Name',
-                    checkinTime: 'Check-in Time',
-                    cookieData: 'Cookie Data',
-                    cookieHint: 'Supports two formats:',
-                    format1: '1. JSON: {"cookies": {"key": "value"}}',
-                    format2: '2. String: key1=value1; key2=value2',
-                    addButton: 'Add Account',
-                    cancel: 'Cancel'
-                },
-                messages: {
-                    loginSuccess: 'Login successful',
-                    loginFailed: 'Invalid credentials',
-                    accountAdded: 'Account added successfully',
-                    accountDeleted: 'Account deleted successfully',
-                    settingsSaved: 'Settings saved successfully',
-                    checkinTriggered: 'Check-in task triggered',
-                    invalidFormat: 'Invalid format',
-                    error: 'Operation failed'
-                }
-            }
-        };
-        
-        let currentLang = localStorage.getItem('language') || 'zh';
-        let authToken = localStorage.getItem('authToken');
-        
-        function t(key) {
-            const keys = key.split('.');
-            let value = translations[currentLang];
-            for (const k of keys) {
-                value = value[k];
-            }
-            return value || key;
-        }
-        
-        function setLanguage(lang) {
-            currentLang = lang;
-            localStorage.setItem('language', lang);
-            updateUILanguage();
-        }
-        
-        function updateUILanguage() {
-            // Update all elements with data-i18n attribute
-            document.querySelectorAll('[data-i18n]').forEach(element => {
-                const key = element.getAttribute('data-i18n');
-                element.textContent = t(key);
-            });
-            
-            // Update placeholders
-            document.querySelectorAll('[data-i18n-placeholder]').forEach(element => {
-                const key = element.getAttribute('data-i18n-placeholder');
-                element.placeholder = t(key);
-            });
-            
-            // Update language switcher
-            document.querySelectorAll('.lang-btn').forEach(btn => {
-                btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
-            });
-        }
-    </script>
-
     <!-- Toast Notification -->
     <div id="toast" class="toast"></div>
 
     <!-- Login Container -->
     <div class="login-container" id="loginContainer">
         <div class="login-box">
-            <h2 data-i18n="login.title">🔐 管理员登录</h2>
-            <form id="loginForm">
+            <h2>🔐 管理员登录</h2>
+            <div id="loginForm">
                 <div class="form-group">
-                    <label data-i18n="login.username">用户名</label>
-                    <input type="text" id="username" required>
+                    <label>用户名</label>
+                    <input type="text" id="username" required autocomplete="username">
                 </div>
                 <div class="form-group">
-                    <label data-i18n="login.password">密码</label>
-                    <input type="password" id="password" required>
+                    <label>密码</label>
+                    <input type="password" id="password" required autocomplete="current-password">
                 </div>
-                <button type="submit" class="btn btn-full" data-i18n="login.button">登录</button>
-            </form>
+                <button type="button" class="btn btn-full" id="loginBtn" onclick="handleLogin()">登录</button>
+                <div class="error-message" id="loginError"></div>
+            </div>
         </div>
     </div>
 
@@ -1429,46 +1126,42 @@ HTML_TEMPLATE = '''
         <div class="container">
             <div class="header">
                 <div class="header-content">
-                    <h1 data-i18n="dashboard.title">📊 LeafLow 自动签到控制面板</h1>
+                    <h1>📊 LeafLow 自动签到控制面板</h1>
                     <div class="header-actions">
-                        <div class="lang-switcher">
-                            <button class="lang-btn" data-lang="zh" onclick="setLanguage('zh')">中文</button>
-                            <button class="lang-btn" data-lang="en" onclick="setLanguage('en')">English</button>
-                        </div>
-                        <button class="btn btn-danger btn-sm" onclick="logout()" data-i18n="dashboard.logout">退出</button>
+                        <button class="btn btn-danger btn-sm" onclick="logout()">退出</button>
                     </div>
                 </div>
             </div>
 
             <div class="stats-grid">
                 <div class="stat-card">
-                    <h3 data-i18n="dashboard.stats.totalAccounts">账号总数</h3>
+                    <h3>账号总数</h3>
                     <div class="value" id="totalAccounts">0</div>
                 </div>
                 <div class="stat-card">
-                    <h3 data-i18n="dashboard.stats.activeAccounts">活跃账号</h3>
+                    <h3>活跃账号</h3>
                     <div class="value" id="activeAccounts">0</div>
                 </div>
                 <div class="stat-card">
-                    <h3 data-i18n="dashboard.stats.totalCheckins">签到总数</h3>
+                    <h3>签到总数</h3>
                     <div class="value" id="totalCheckins">0</div>
                 </div>
                 <div class="stat-card">
-                    <h3 data-i18n="dashboard.stats.successRate">成功率</h3>
+                    <h3>成功率</h3>
                     <div class="value" id="successRate">0%</div>
                 </div>
             </div>
 
             <div class="section">
-                <h2 data-i18n="dashboard.todayCheckins.title">📅 今日签到记录</h2>
+                <h2>📅 今日签到记录</h2>
                 <div class="table-wrapper">
                     <table class="table">
                         <thead>
                             <tr>
-                                <th data-i18n="dashboard.todayCheckins.account">账号</th>
-                                <th data-i18n="dashboard.todayCheckins.status">状态</th>
-                                <th class="hide-mobile" data-i18n="dashboard.todayCheckins.message">消息</th>
-                                <th data-i18n="dashboard.todayCheckins.time">时间</th>
+                                <th>账号</th>
+                                <th>状态</th>
+                                <th>消息</th>
+                                <th>时间</th>
                             </tr>
                         </thead>
                         <tbody id="todayCheckins">
@@ -1484,17 +1177,17 @@ HTML_TEMPLATE = '''
 
             <div class="section">
                 <div class="section-header">
-                    <h2 data-i18n="dashboard.accounts.title">👥 账号管理</h2>
-                    <button class="btn btn-success btn-sm" onclick="showAddAccountModal()" data-i18n="dashboard.accounts.addButton">+ 添加账号</button>
+                    <h2>👥 账号管理</h2>
+                    <button class="btn btn-success btn-sm" onclick="showAddAccountModal()">+ 添加账号</button>
                 </div>
                 <div class="table-wrapper">
                     <table class="table">
                         <thead>
                             <tr>
-                                <th data-i18n="dashboard.accounts.name">名称</th>
-                                <th data-i18n="dashboard.accounts.status">状态</th>
-                                <th class="hide-mobile" data-i18n="dashboard.accounts.checkinTime">签到时间</th>
-                                <th data-i18n="dashboard.accounts.actions">操作</th>
+                                <th>名称</th>
+                                <th>状态</th>
+                                <th>签到时间</th>
+                                <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="accountsList">
@@ -1509,28 +1202,26 @@ HTML_TEMPLATE = '''
             </div>
 
             <div class="section">
-                <h2 data-i18n="dashboard.notifications.title">🔔 通知设置</h2>
+                <h2>🔔 通知设置</h2>
                 <div class="form-group">
                     <label>
                         <input type="checkbox" id="notifyEnabled"> 
-                        <span data-i18n="dashboard.notifications.enable">启用通知</span>
+                        <span>启用通知</span>
                     </label>
                 </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label data-i18n="dashboard.notifications.telegramBot">Telegram Bot Token</label>
-                        <input type="text" id="tgBotToken" placeholder="Bot token">
-                    </div>
-                    <div class="form-group">
-                        <label data-i18n="dashboard.notifications.telegramUser">Telegram User ID</label>
-                        <input type="text" id="tgUserId" placeholder="User ID">
-                    </div>
+                <div class="form-group">
+                    <label>Telegram Bot Token</label>
+                    <input type="text" id="tgBotToken" placeholder="Bot token">
                 </div>
                 <div class="form-group">
-                    <label data-i18n="dashboard.notifications.wechatKey">企业微信 Webhook Key</label>
+                    <label>Telegram User ID</label>
+                    <input type="text" id="tgUserId" placeholder="User ID">
+                </div>
+                <div class="form-group">
+                    <label>企业微信 Webhook Key</label>
                     <input type="text" id="wechatKey" placeholder="Webhook key">
                 </div>
-                <button class="btn btn-sm" onclick="saveNotificationSettings()" data-i18n="dashboard.notifications.save">保存设置</button>
+                <button class="btn btn-sm" onclick="saveNotificationSettings()">保存设置</button>
             </div>
         </div>
     </div>
@@ -1539,38 +1230,37 @@ HTML_TEMPLATE = '''
     <div class="modal" id="addAccountModal">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 data-i18n="modal.addAccount">添加新账号</h3>
+                <h3>添加新账号</h3>
                 <button class="close" onclick="closeModal()">&times;</button>
             </div>
-            <form id="addAccountForm">
+            <div id="addAccountForm">
                 <div class="form-group">
-                    <label data-i18n="modal.accountName">账号名称</label>
+                    <label>账号名称</label>
                     <input type="text" id="accountName" required>
                 </div>
                 <div class="form-group">
-                    <label data-i18n="modal.checkinTime">签到时间</label>
+                    <label>签到时间</label>
                     <input type="time" id="checkinTime" value="01:00" required>
                 </div>
                 <div class="form-group">
-                    <label data-i18n="modal.cookieData">Cookie 数据</label>
+                    <label>Cookie 数据</label>
                     <textarea id="tokenData" rows="6" placeholder='{"cookies": {"key": "value"}} or key1=value1; key2=value2' required></textarea>
-                    <div class="format-hint">
-                        <div data-i18n="modal.cookieHint">支持两种格式：</div>
-                        <div style="margin-top: 8px;">
-                            <div data-i18n="modal.format1">1. JSON格式：{"cookies": {"key": "value"}}</div>
-                            <div data-i18n="modal.format2">2. 字符串格式：key1=value1; key2=value2</div>
-                        </div>
-                    </div>
                 </div>
                 <div style="display: flex; gap: 10px; margin-top: 20px;">
-                    <button type="submit" class="btn btn-full" data-i18n="modal.addButton">添加账号</button>
-                    <button type="button" class="btn btn-danger" onclick="closeModal()" data-i18n="modal.cancel">取消</button>
+                    <button type="button" class="btn btn-full" onclick="addAccount()">添加账号</button>
+                    <button type="button" class="btn btn-danger" onclick="closeModal()">取消</button>
                 </div>
-            </form>
+            </div>
         </div>
     </div>
 
     <script>
+        // 全局变量
+        let authToken = localStorage.getItem('authToken');
+        
+        // 调试：打印初始状态
+        console.log('Page loaded, authToken:', authToken ? 'exists' : 'not found');
+
         // Toast notification function
         function showToast(message, type = 'info') {
             const toast = document.getElementById('toast');
@@ -1583,39 +1273,34 @@ HTML_TEMPLATE = '''
             }, 3000);
         }
 
-        // Check authentication on page load
-        if (authToken) {
-            // Verify token is still valid
-            fetch('/api/dashboard', {
-                headers: {
-                    'Authorization': 'Bearer ' + authToken
-                }
-            }).then(response => {
-                if (response.ok) {
-                    showDashboard();
-                } else {
-                    localStorage.removeItem('authToken');
-                    authToken = null;
-                }
-            }).catch(() => {
-                localStorage.removeItem('authToken');
-                authToken = null;
-            });
+        // 显示登录错误
+        function showLoginError(message) {
+            const errorDiv = document.getElementById('loginError');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
         }
 
-        // Initialize language
-        document.addEventListener('DOMContentLoaded', () => {
-            updateUILanguage();
-        });
-
-        // Login form
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
+        // 处理登录 - 使用普通函数而不是事件监听器
+        async function handleLogin() {
+            console.log('handleLogin called');
+            
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
+            
+            if (!username || !password) {
+                showLoginError('请输入用户名和密码');
+                return;
+            }
+            
+            const loginBtn = document.getElementById('loginBtn');
+            loginBtn.disabled = true;
+            loginBtn.textContent = '登录中...';
 
             try {
-                console.log('Attempting login...');
+                console.log('Sending login request...');
                 const response = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 
@@ -1624,33 +1309,80 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify({ username, password })
                 });
 
+                console.log('Response status:', response.status);
                 const data = await response.json();
-                console.log('Login response:', response.status, data);
+                console.log('Response data:', data);
                 
-                if (response.ok) {
+                if (response.ok && data.token) {
                     authToken = data.token;
                     localStorage.setItem('authToken', authToken);
-                    showToast(t('messages.loginSuccess'), 'success');
-                    setTimeout(() => showDashboard(), 500);
+                    showToast('登录成功', 'success');
+                    
+                    // 直接显示仪表板
+                    document.getElementById('loginContainer').style.display = 'none';
+                    document.getElementById('dashboard').style.display = 'block';
+                    
+                    // 加载数据
+                    loadDashboard();
+                    loadAccounts();
+                    loadNotificationSettings();
                 } else {
-                    showToast(data.message || t('messages.loginFailed'), 'error');
+                    showLoginError(data.message || '用户名或密码错误');
                 }
             } catch (error) {
                 console.error('Login error:', error);
-                showToast(t('messages.error') + ': ' + error.message, 'error');
+                showLoginError('登录失败：' + error.message);
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = '登录';
+            }
+        }
+
+        // 监听回车键
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('DOM loaded');
+            
+            // 为输入框添加回车键监听
+            document.getElementById('username').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    handleLogin();
+                }
+            });
+            
+            document.getElementById('password').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    handleLogin();
+                }
+            });
+            
+            // 检查是否已登录
+            if (authToken) {
+                console.log('Checking existing token...');
+                // 验证 token 是否有效
+                fetch('/api/dashboard', {
+                    headers: {
+                        'Authorization': 'Bearer ' + authToken
+                    }
+                }).then(response => {
+                    if (response.ok) {
+                        console.log('Token valid, showing dashboard');
+                        document.getElementById('loginContainer').style.display = 'none';
+                        document.getElementById('dashboard').style.display = 'block';
+                        loadDashboard();
+                        loadAccounts();
+                        loadNotificationSettings();
+                    } else {
+                        console.log('Token invalid, clearing');
+                        localStorage.removeItem('authToken');
+                        authToken = null;
+                    }
+                }).catch(error => {
+                    console.error('Token check error:', error);
+                    localStorage.removeItem('authToken');
+                    authToken = null;
+                });
             }
         });
-
-        function showDashboard() {
-            document.getElementById('loginContainer').style.display = 'none';
-            document.getElementById('dashboard').style.display = 'block';
-            updateUILanguage();
-            loadDashboard();
-            loadAccounts();
-            loadNotificationSettings();
-            // Refresh every 30 seconds
-            setInterval(loadDashboard, 30000);
-        }
 
         function logout() {
             localStorage.removeItem('authToken');
@@ -1702,13 +1434,13 @@ HTML_TEMPLATE = '''
                 if (data.today_checkins && data.today_checkins.length > 0) {
                     data.today_checkins.forEach(checkin => {
                         const tr = document.createElement('tr');
-                        const statusText = checkin.success ? t('dashboard.todayCheckins.success') : t('dashboard.todayCheckins.failed');
+                        const statusText = checkin.success ? '成功' : '失败';
                         const statusClass = checkin.success ? 'badge-success' : 'badge-danger';
                         const time = checkin.created_at ? new Date(checkin.created_at).toLocaleTimeString() : '-';
                         tr.innerHTML = `
                             <td>${checkin.name || '-'}</td>
                             <td><span class="badge ${statusClass}">${statusText}</span></td>
-                            <td class="hide-mobile">${checkin.message || '-'}</td>
+                            <td>${checkin.message || '-'}</td>
                             <td>${time}</td>
                         `;
                         tbody.appendChild(tr);
@@ -1740,14 +1472,12 @@ HTML_TEMPLATE = '''
                                     <span class="slider"></span>
                                 </label>
                             </td>
-                            <td class="hide-mobile">
+                            <td>
                                 <input type="time" value="${account.checkin_time}" onchange="updateCheckinTime(${account.id}, this.value)" style="border: 2px solid #e0e0e0; padding: 6px; border-radius: 6px;">
                             </td>
                             <td>
-                                <div class="action-buttons">
-                                    <button class="btn btn-success btn-sm" onclick="manualCheckin(${account.id})">${t('dashboard.accounts.checkinNow')}</button>
-                                    <button class="btn btn-danger btn-sm" onclick="deleteAccount(${account.id})">${t('dashboard.accounts.delete')}</button>
-                                </div>
+                                <button class="btn btn-success btn-sm" onclick="manualCheckin(${account.id})">立即签到</button>
+                                <button class="btn btn-danger btn-sm" onclick="deleteAccount(${account.id})">删除</button>
                             </td>
                         `;
                         tbody.appendChild(tr);
@@ -1782,7 +1512,7 @@ HTML_TEMPLATE = '''
                 });
                 loadAccounts();
             } catch (error) {
-                showToast(t('messages.error'), 'error');
+                showToast('操作失败', 'error');
             }
         }
 
@@ -1793,30 +1523,30 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify({ checkin_time })
                 });
             } catch (error) {
-                showToast(t('messages.error'), 'error');
+                showToast('操作失败', 'error');
             }
         }
 
         async function manualCheckin(id) {
-            if (confirm(t('dashboard.accounts.confirmCheckin'))) {
+            if (confirm('确定立即执行签到吗？')) {
                 try {
-                    const result = await apiCall(`/api/checkin/manual/${id}`, { method: 'POST' });
-                    showToast(t('messages.checkinTriggered'), 'success');
+                    await apiCall(`/api/checkin/manual/${id}`, { method: 'POST' });
+                    showToast('签到任务已触发', 'success');
                     setTimeout(loadDashboard, 2000);
                 } catch (error) {
-                    showToast(t('messages.error'), 'error');
+                    showToast('操作失败', 'error');
                 }
             }
         }
 
         async function deleteAccount(id) {
-            if (confirm(t('dashboard.accounts.confirmDelete'))) {
+            if (confirm('确定删除此账号吗？')) {
                 try {
                     await apiCall(`/api/accounts/${id}`, { method: 'DELETE' });
-                    showToast(t('messages.accountDeleted'), 'success');
+                    showToast('账号删除成功', 'success');
                     loadAccounts();
                 } catch (error) {
-                    showToast(t('messages.error'), 'error');
+                    showToast('操作失败', 'error');
                 }
             }
         }
@@ -1834,25 +1564,24 @@ HTML_TEMPLATE = '''
                     method: 'PUT',
                     body: JSON.stringify(settings)
                 });
-                showToast(t('messages.settingsSaved'), 'success');
+                showToast('设置保存成功', 'success');
             } catch (error) {
-                showToast(t('messages.error'), 'error');
+                showToast('操作失败', 'error');
             }
         }
 
         function showAddAccountModal() {
             document.getElementById('addAccountModal').style.display = 'flex';
-            updateUILanguage();
         }
 
         function closeModal() {
             document.getElementById('addAccountModal').style.display = 'none';
-            document.getElementById('addAccountForm').reset();
+            document.getElementById('accountName').value = '';
+            document.getElementById('checkinTime').value = '01:00';
+            document.getElementById('tokenData').value = '';
         }
 
-        document.getElementById('addAccountForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
+        async function addAccount() {
             try {
                 const account = {
                     name: document.getElementById('accountName').value,
@@ -1860,18 +1589,23 @@ HTML_TEMPLATE = '''
                     token_data: document.getElementById('tokenData').value
                 };
 
+                if (!account.name || !account.token_data) {
+                    showToast('请填写完整信息', 'error');
+                    return;
+                }
+
                 await apiCall('/api/accounts', {
                     method: 'POST',
                     body: JSON.stringify(account)
                 });
                 
-                showToast(t('messages.accountAdded'), 'success');
+                showToast('账号添加成功', 'success');
                 closeModal();
                 loadAccounts();
             } catch (error) {
-                showToast(t('messages.invalidFormat') + ': ' + error.message, 'error');
+                showToast('格式无效: ' + error.message, 'error');
             }
-        });
+        }
 
         // Close modal when clicking outside
         window.onclick = function(event) {
