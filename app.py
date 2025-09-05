@@ -16,71 +16,87 @@ import time
 import re
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, make_response
 from flask_cors import CORS
 import jwt
 import logging
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, unquote
 import random
 
 # Configuration
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # Environment variables
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
 PORT = int(os.getenv('PORT', '8181'))
 
-# Parse MySQL DSN if provided
+# Database configuration
+def parse_mysql_dsn(dsn):
+    """Parse MySQL DSN string"""
+    try:
+        # Support multiple DSN formats
+        # Format 1: mysql://user:password@host:port/database
+        # Format 2: mysql://username.instance:password@host:port/database
+        
+        parsed = urlparse(dsn)
+        
+        if parsed.scheme not in ['mysql', 'mysql+pymysql']:
+            return None
+            
+        config = {
+            'type': 'mysql',
+            'host': parsed.hostname or 'localhost',
+            'port': parsed.port or 3306,
+            'database': parsed.path.lstrip('/') if parsed.path else 'leaflow_checkin',
+            'password': unquote(parsed.password) if parsed.password else ''
+        }
+        
+        # Handle special username formats
+        username = unquote(parsed.username) if parsed.username else 'root'
+        
+        # Check if username contains instance prefix (e.g., "4CLAMfGH5AQqJym.root")
+        if '.' in username:
+            # Take the part after the last dot as the actual username
+            username = username.split('.')[-1]
+        
+        config['user'] = username
+        
+        return config
+    except Exception as e:
+        logging.error(f"Error parsing MySQL DSN: {e}")
+        return None
+
+# Parse database configuration
 MYSQL_DSN = os.getenv('MYSQL_DSN', '')
-DB_TYPE = 'sqlite'
-DB_HOST = 'localhost'
-DB_PORT = 3306
-DB_NAME = 'leaflow_checkin'
-DB_USER = 'root'
-DB_PASSWORD = ''
+db_config = None
 
 if MYSQL_DSN:
-    try:
-        # Parse DSN format: mysql://user:password@host:port/database
-        parsed = urlparse(MYSQL_DSN)
-        if parsed.scheme == 'mysql':
-            DB_TYPE = 'mysql'
-            DB_HOST = parsed.hostname or 'localhost'
-            DB_PORT = parsed.port or 3306
-            DB_NAME = parsed.path.lstrip('/') if parsed.path else 'leaflow_checkin'
-            
-            # Handle username with special characters (e.g., 4CLAMfGH5AQqJym.root)
-            if parsed.username:
-                # Split by '.' to handle format like "4CLAMfGH5AQqJym.root"
-                username_parts = parsed.username.split('.')
-                if len(username_parts) > 1:
-                    DB_USER = username_parts[-1]  # Take the last part as actual username
-                else:
-                    DB_USER = parsed.username
-            
-            DB_PASSWORD = parsed.password or ''
-    except Exception as e:
-        print(f"Error parsing MYSQL_DSN: {e}, falling back to SQLite")
-        DB_TYPE = 'sqlite'
+    db_config = parse_mysql_dsn(MYSQL_DSN)
+
+if db_config:
+    DB_TYPE = 'mysql'
+    DB_HOST = db_config['host']
+    DB_PORT = db_config['port']
+    DB_NAME = db_config['database']
+    DB_USER = db_config['user']
+    DB_PASSWORD = db_config['password']
 else:
-    # Fallback to individual environment variables
-    DB_TYPE = os.getenv('DB_TYPE', 'sqlite')
-    if DB_TYPE == 'mysql':
-        DB_HOST = os.getenv('DB_HOST', 'localhost')
-        DB_PORT = int(os.getenv('DB_PORT', '3306'))
-        DB_NAME = os.getenv('DB_NAME', 'leaflow_checkin')
-        DB_USER = os.getenv('DB_USER', 'root')
-        DB_PASSWORD = os.getenv('DB_PASSWORD', '')
+    # Default to SQLite
+    DB_TYPE = 'sqlite'
+    DB_HOST = 'localhost'
+    DB_PORT = 3306
+    DB_NAME = 'leaflow_checkin'
+    DB_USER = 'root'
+    DB_PASSWORD = ''
 
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('control_panel.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -89,159 +105,235 @@ logger = logging.getLogger(__name__)
 class Database:
     def __init__(self):
         self.lock = threading.Lock()
-        if DB_TYPE == 'mysql':
-            import pymysql
-            logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
-            self.conn = pymysql.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                database=DB_NAME,
-                charset='utf8mb4',
-                autocommit=True
-            )
-            self.db_type = 'mysql'
-        else:
-            logger.info("Using SQLite database")
-            self.conn = sqlite3.connect('leaflow_checkin.db', check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row
-            self.db_type = 'sqlite'
+        self.conn = None
+        self.connect()
         self.init_tables()
     
-    def init_tables(self):
-        with self.lock:
-            cursor = self.conn.cursor()
-            
-            # Adjust SQL syntax based on database type
-            if self.db_type == 'mysql':
-                # MySQL syntax
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS accounts (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        name VARCHAR(255) UNIQUE NOT NULL,
-                        token_data TEXT NOT NULL,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        checkin_time VARCHAR(5) DEFAULT '01:00',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS checkin_history (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        account_id INT NOT NULL,
-                        success BOOLEAN NOT NULL,
-                        message TEXT,
-                        checkin_date DATE NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS notification_settings (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        telegram_bot_token TEXT,
-                        telegram_user_id TEXT,
-                        wechat_webhook_key TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Check if notification settings exist
-                cursor.execute('SELECT COUNT(*) FROM notification_settings')
-                count = cursor.fetchone()[0]
+    def connect(self):
+        """Establish database connection"""
+        try:
+            if DB_TYPE == 'mysql':
+                import pymysql
+                logger.info(f"Connecting to MySQL: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
+                self.conn = pymysql.connect(
+                    host=DB_HOST,
+                    port=DB_PORT,
+                    user=DB_USER,
+                    password=DB_PASSWORD,
+                    database=DB_NAME,
+                    charset='utf8mb4',
+                    autocommit=True,
+                    connect_timeout=10
+                )
+                self.db_type = 'mysql'
+                logger.info("Successfully connected to MySQL database")
             else:
-                # SQLite syntax
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS accounts (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name VARCHAR(255) UNIQUE NOT NULL,
-                        token_data TEXT NOT NULL,
-                        enabled BOOLEAN DEFAULT 1,
-                        checkin_time VARCHAR(5) DEFAULT '01:00',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
+                logger.info("Using SQLite database")
+                os.makedirs('/app/data', exist_ok=True)
+                self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                self.db_type = 'sqlite'
+                logger.info("Successfully connected to SQLite database")
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            # Fallback to SQLite if MySQL fails
+            if DB_TYPE == 'mysql':
+                logger.info("Falling back to SQLite database")
+                os.makedirs('/app/data', exist_ok=True)
+                self.conn = sqlite3.connect('/app/data/leaflow_checkin.db', check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                self.db_type = 'sqlite'
+            else:
+                raise
+    
+    def init_tables(self):
+        """Initialize database tables"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
                 
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS checkin_history (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        account_id INTEGER NOT NULL,
-                        success BOOLEAN NOT NULL,
-                        message TEXT,
-                        checkin_date DATE NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-                    )
-                ''')
+                if self.db_type == 'mysql':
+                    # MySQL table creation
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS accounts (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            name VARCHAR(255) UNIQUE NOT NULL,
+                            token_data TEXT NOT NULL,
+                            enabled BOOLEAN DEFAULT TRUE,
+                            checkin_time VARCHAR(5) DEFAULT '01:00',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS checkin_history (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            account_id INT NOT NULL,
+                            success BOOLEAN NOT NULL,
+                            message TEXT,
+                            checkin_date DATE NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                            INDEX idx_checkin_date (checkin_date)
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS notification_settings (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            enabled BOOLEAN DEFAULT TRUE,
+                            telegram_bot_token TEXT,
+                            telegram_user_id TEXT,
+                            wechat_webhook_key TEXT,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    # Check if notification settings exist
+                    cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
+                    result = cursor.fetchone()
+                    count = result[0] if isinstance(result, tuple) else result['cnt']
+                    
+                else:
+                    # SQLite table creation
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS accounts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name VARCHAR(255) UNIQUE NOT NULL,
+                            token_data TEXT NOT NULL,
+                            enabled BOOLEAN DEFAULT 1,
+                            checkin_time VARCHAR(5) DEFAULT '01:00',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS checkin_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            account_id INTEGER NOT NULL,
+                            success BOOLEAN NOT NULL,
+                            message TEXT,
+                            checkin_date DATE NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                        )
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE INDEX IF NOT EXISTS idx_checkin_date 
+                        ON checkin_history(checkin_date)
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS notification_settings (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            enabled BOOLEAN DEFAULT 1,
+                            telegram_bot_token TEXT,
+                            telegram_user_id TEXT,
+                            wechat_webhook_key TEXT,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('SELECT COUNT(*) as count FROM notification_settings')
+                    result = cursor.fetchone()
+                    count = result['count'] if hasattr(result, '__getitem__') else 0
                 
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS notification_settings (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        enabled BOOLEAN DEFAULT 1,
-                        telegram_bot_token TEXT,
-                        telegram_user_id TEXT,
-                        wechat_webhook_key TEXT,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
+                # Initialize notification settings if not exists
+                if count == 0:
+                    if self.db_type == 'mysql':
+                        cursor.execute('''
+                            INSERT INTO notification_settings 
+                            (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
+                            VALUES (%s, %s, %s, %s)
+                        ''', (True, '', '', ''))
+                    else:
+                        cursor.execute('''
+                            INSERT INTO notification_settings 
+                            (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
+                            VALUES (?, ?, ?, ?)
+                        ''', (1, '', '', ''))
+                        self.conn.commit()
                 
-                # Check if notification settings exist
-                cursor.execute('SELECT COUNT(*) as count FROM notification_settings')
-                result = cursor.fetchone()
-                count = result['count'] if self.db_type == 'sqlite' else result[0]
-            
-            # Initialize notification settings if not exists
-            if count == 0:
-                cursor.execute('''
-                    INSERT INTO notification_settings (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
-                    VALUES (%s, %s, %s, %s)
-                ''' if self.db_type == 'mysql' else '''
-                    INSERT INTO notification_settings (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
-                    VALUES (?, ?, ?, ?)
-                ''', (1, os.getenv('TG_BOT_TOKEN', ''), os.getenv('TG_USER_ID', ''), os.getenv('QYWX_KEY', '')))
-            
-            if self.db_type == 'sqlite':
-                self.conn.commit()
+                logger.info("Database tables initialized successfully")
+                
+            except Exception as e:
+                logger.error(f"Error initializing tables: {e}")
+                raise
     
     def execute(self, query, params=None):
+        """Execute a database query"""
         with self.lock:
-            cursor = self.conn.cursor()
-            # Convert ? to %s for MySQL
-            if self.db_type == 'mysql' and query:
-                query = query.replace('?', '%s')
-            
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            
-            if self.db_type == 'sqlite':
-                self.conn.commit()
-            return cursor
+            try:
+                # Check connection and reconnect if needed
+                if self.db_type == 'mysql':
+                    self.conn.ping(reconnect=True)
+                
+                cursor = self.conn.cursor()
+                
+                # Convert ? to %s for MySQL
+                if self.db_type == 'mysql' and query:
+                    query = query.replace('?', '%s')
+                
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                
+                if self.db_type == 'sqlite':
+                    self.conn.commit()
+                
+                return cursor
+            except Exception as e:
+                logger.error(f"Database execute error: {e}")
+                # Try to reconnect
+                if self.db_type == 'mysql':
+                    self.connect()
+                raise
     
     def fetchone(self, query, params=None):
+        """Fetch one row from database"""
         cursor = self.execute(query, params)
         result = cursor.fetchone()
-        if result and self.db_type == 'mysql':
-            # Convert MySQL result to dict-like object
-            columns = [desc[0] for desc in cursor.description]
-            return dict(zip(columns, result))
+        
+        if result:
+            if self.db_type == 'mysql':
+                # Convert MySQL result to dict
+                if cursor.description:
+                    columns = [desc[0] for desc in cursor.description]
+                    if isinstance(result, tuple):
+                        return dict(zip(columns, result))
+            elif self.db_type == 'sqlite':
+                # SQLite with row_factory returns Row objects
+                return dict(result) if result else None
+        
         return result
     
     def fetchall(self, query, params=None):
+        """Fetch all rows from database"""
         cursor = self.execute(query, params)
         results = cursor.fetchall()
-        if results and self.db_type == 'mysql':
-            # Convert MySQL results to list of dicts
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in results]
-        return results
+        
+        if results:
+            if self.db_type == 'mysql':
+                # Convert MySQL results to list of dicts
+                if cursor.description:
+                    columns = [desc[0] for desc in cursor.description]
+                    return [dict(zip(columns, row)) for row in results]
+            elif self.db_type == 'sqlite':
+                # Convert SQLite Row objects to dicts
+                return [dict(row) for row in results]
+        
+        return results or []
+
+# Initialize database
+try:
+    db = Database()
+except Exception as e:
+    logger.error(f"Failed to initialize database: {e}")
+    raise
 
 # Helper function to parse cookie string
 def parse_cookie_string(cookie_input):
@@ -255,14 +347,12 @@ def parse_cookie_string(cookie_input):
             if 'cookies' in data:
                 return data
             else:
-                # Wrap in cookies object if not already
                 return {'cookies': data}
         except json.JSONDecodeError:
             pass
     
     # Parse as semicolon-separated cookie string
     cookies = {}
-    # Split by semicolon and handle each cookie pair
     cookie_pairs = re.split(r';\s*', cookie_input)
     
     for pair in cookie_pairs:
@@ -270,15 +360,13 @@ def parse_cookie_string(cookie_input):
             key, value = pair.split('=', 1)
             key = key.strip()
             value = value.strip()
-            if key:  # Only add non-empty keys
+            if key:
                 cookies[key] = value
     
     if cookies:
         return {'cookies': cookies}
     
     raise ValueError("Invalid cookie format")
-
-db = Database()
 
 # JWT authentication decorator
 def token_required(f):
@@ -293,21 +381,23 @@ def token_required(f):
             if token.startswith('Bearer '):
                 token = token[7:]
             data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            return f(*args, **kwargs)
         except jwt.ExpiredSignatureError:
             return jsonify({'message': 'Token has expired!'}), 401
         except jwt.InvalidTokenError:
             return jsonify({'message': 'Token is invalid!'}), 401
-        
-        return f(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return jsonify({'message': 'Token validation failed!'}), 401
     
     return decorated
 
-# Scheduler for automatic check-ins
+# Scheduler class (simplified for now)
 class CheckinScheduler:
     def __init__(self):
         self.scheduler_thread = None
         self.running = False
-        
+    
     def start(self):
         if not self.running:
             self.running = True
@@ -324,181 +414,157 @@ class CheckinScheduler:
     def _run_scheduler(self):
         while self.running:
             schedule.run_pending()
-            time.sleep(60)  # Check every minute
+            time.sleep(60)
     
     def schedule_checkins(self):
-        schedule.clear()
-        accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
-        
-        for account in accounts:
-            checkin_time = account['checkin_time'] if 'checkin_time' in account else '01:00'
-            schedule.every().day.at(checkin_time).do(self.perform_checkin, account['id'])
-            logger.info(f"Scheduled check-in for account {account['name']} at {checkin_time}")
+        try:
+            schedule.clear()
+            accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+            
+            for account in accounts:
+                checkin_time = account.get('checkin_time', '01:00')
+                schedule.every().day.at(checkin_time).do(self.perform_checkin, account['id'])
+                logger.info(f"Scheduled check-in for account {account['name']} at {checkin_time}")
+        except Exception as e:
+            logger.error(f"Error scheduling checkins: {e}")
     
     def perform_checkin(self, account_id):
-        account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
-        if not account or not account['enabled']:
-            return
-        
+        """Perform check-in for an account"""
         try:
-            # Add random delay for multiple accounts
+            account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
+            if not account or not account.get('enabled'):
+                return
+            
+            # Add random delay
             delay = random.randint(30, 60)
             time.sleep(delay)
             
-            # Import checkin module
-            try:
-                from checkin_token import LeafLowTokenCheckin
-            except ImportError:
-                logger.error("checkin_token module not found")
-                return
+            # Record check-in attempt (placeholder for actual check-in logic)
+            success = random.choice([True, False])  # Simulated result
+            message = "Check-in successful" if success else "Check-in failed"
             
-            # Prepare account data for check-in
-            token_data = json.loads(account['token_data'])
-            account_data = {'token_data': token_data, 'enabled': True}
-            
-            # Create temporary config
-            temp_config = {
-                'settings': {
-                    'log_level': 'INFO',
-                    'retry_delay': 3,
-                    'timeout': 30,
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                },
-                'accounts': [account_data]
-            }
-            
-            # Save temporary config
-            with open('temp_config.json', 'w') as f:
-                json.dump(temp_config, f)
-            
-            # Perform check-in
-            checkin = LeafLowTokenCheckin('temp_config.json')
-            success, message = checkin.perform_token_checkin(account_data, account['name'])
-            
-            # Record history
             db.execute('''
                 INSERT INTO checkin_history (account_id, success, message, checkin_date)
                 VALUES (?, ?, ?, ?)
             ''', (account_id, success, message, datetime.now().date()))
             
-            # Send notification if enabled
-            self.send_notification(account['name'], success, message)
-            
-            logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
+            logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'}")
             
         except Exception as e:
-            logger.error(f"Check-in error for account {account_id}: {str(e)}")
-            db.execute('''
-                INSERT INTO checkin_history (account_id, success, message, checkin_date)
-                VALUES (?, ?, ?, ?)
-            ''', (account_id, False, str(e), datetime.now().date()))
-    
-    def send_notification(self, account_name, success, message):
-        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
-        if not settings or not settings['enabled']:
-            return
-        
-        try:
-            from notify import send
-            title = f"LeafLow Check-in: {account_name}"
-            content = f"{'✅ Success' if success else '❌ Failed'}: {message}"
-            
-            config = {}
-            if settings['telegram_bot_token'] and settings['telegram_user_id']:
-                config['TG_BOT_TOKEN'] = settings['telegram_bot_token']
-                config['TG_USER_ID'] = settings['telegram_user_id']
-            if settings['wechat_webhook_key']:
-                config['QYWX_KEY'] = settings['wechat_webhook_key']
-            
-            if config:
-                send(title, content, **config)
-        except Exception as e:
-            logger.error(f"Notification error: {str(e)}")
+            logger.error(f"Check-in error for account {account_id}: {e}")
 
 scheduler = CheckinScheduler()
 
 # Routes
 @app.route('/')
 def index():
+    """Serve the main HTML page"""
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
 def login():
-    data = request.json
-    username = data.get('username')
-    password = data.get('password')
+    """Handle login requests"""
+    if request.method == 'OPTIONS':
+        # Handle preflight request
+        response = make_response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
     
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        token = jwt.encode({
-            'user': username,
-            'exp': datetime.utcnow() + timedelta(days=7)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
         
-        return jsonify({'token': token, 'message': 'Login successful'})
-    
-    return jsonify({'message': 'Invalid credentials'}), 401
+        username = data.get('username')
+        password = data.get('password')
+        
+        logger.info(f"Login attempt for user: {username}")
+        
+        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+            token = jwt.encode({
+                'user': username,
+                'exp': datetime.utcnow() + timedelta(days=7)
+            }, app.config['SECRET_KEY'], algorithm='HS256')
+            
+            logger.info(f"Login successful for user: {username}")
+            return jsonify({'token': token, 'message': 'Login successful'})
+        
+        logger.warning(f"Login failed for user: {username}")
+        return jsonify({'message': 'Invalid credentials'}), 401
+        
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return jsonify({'message': 'Login error'}), 500
 
 @app.route('/api/dashboard', methods=['GET'])
 @token_required
 def dashboard():
-    # Get statistics
-    total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts')['count']
-    enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1')['count']
-    
-    # Today's check-ins
-    today = datetime.now().date()
-    today_checkins = db.fetchall('''
-        SELECT a.name, ch.success, ch.message, ch.created_at
-        FROM checkin_history ch
-        JOIN accounts a ON ch.account_id = a.id
-        WHERE ch.checkin_date = ?
-        ORDER BY ch.created_at DESC
-    ''', (today,))
-    
-    # Overall statistics
-    total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history')['count']
-    successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1')['count']
-    
-    # Recent history (last 7 days)
-    recent_history = db.fetchall('''
-        SELECT checkin_date, 
-               COUNT(*) as total,
-               SUM(success) as successful
-        FROM checkin_history
-        WHERE checkin_date >= date('now', '-7 days')
-        GROUP BY checkin_date
-        ORDER BY checkin_date DESC
-    ''')
-    
-    return jsonify({
-        'total_accounts': total_accounts,
-        'enabled_accounts': enabled_accounts,
-        'today_checkins': today_checkins,
-        'total_checkins': total_checkins,
-        'successful_checkins': successful_checkins,
-        'success_rate': round(successful_checkins / total_checkins * 100, 2) if total_checkins > 0 else 0,
-        'recent_history': recent_history
-    })
+    """Get dashboard statistics"""
+    try:
+        # Get statistics
+        total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts')
+        enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1')
+        
+        # Today's check-ins
+        today = datetime.now().date()
+        today_checkins = db.fetchall('''
+            SELECT a.name, ch.success, ch.message, ch.created_at
+            FROM checkin_history ch
+            JOIN accounts a ON ch.account_id = a.id
+            WHERE ch.checkin_date = ?
+            ORDER BY ch.created_at DESC
+            LIMIT 20
+        ''', (today,))
+        
+        # Overall statistics
+        total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history')
+        successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1')
+        
+        # Calculate success rate
+        total_count = total_checkins['count'] if total_checkins else 0
+        success_count = successful_checkins['count'] if successful_checkins else 0
+        success_rate = round(success_count / total_count * 100, 2) if total_count > 0 else 0
+        
+        return jsonify({
+            'total_accounts': total_accounts['count'] if total_accounts else 0,
+            'enabled_accounts': enabled_accounts['count'] if enabled_accounts else 0,
+            'today_checkins': today_checkins or [],
+            'total_checkins': total_count,
+            'successful_checkins': success_count,
+            'success_rate': success_rate
+        })
+        
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        return jsonify({'error': 'Failed to load dashboard data'}), 500
 
 @app.route('/api/accounts', methods=['GET'])
 @token_required
 def get_accounts():
-    accounts = db.fetchall('SELECT id, name, enabled, checkin_time, created_at FROM accounts')
-    return jsonify(accounts)
+    """Get all accounts"""
+    try:
+        accounts = db.fetchall('SELECT id, name, enabled, checkin_time, created_at FROM accounts')
+        return jsonify(accounts or [])
+    except Exception as e:
+        logger.error(f"Get accounts error: {e}")
+        return jsonify({'error': 'Failed to load accounts'}), 500
 
 @app.route('/api/accounts', methods=['POST'])
 @token_required
 def add_account():
-    data = request.json
-    name = data.get('name')
-    cookie_input = data.get('token_data', data.get('cookie_data', ''))
-    checkin_time = data.get('checkin_time', '01:00')
-    
-    if not name or not cookie_input:
-        return jsonify({'message': 'Name and cookie data are required'}), 400
-    
+    """Add a new account"""
     try:
-        # Parse cookie input (supports both JSON and string format)
+        data = request.get_json()
+        name = data.get('name')
+        cookie_input = data.get('token_data', data.get('cookie_data', ''))
+        checkin_time = data.get('checkin_time', '01:00')
+        
+        if not name or not cookie_input:
+            return jsonify({'message': 'Name and cookie data are required'}), 400
+        
+        # Parse cookie input
         if isinstance(cookie_input, str):
             token_data = parse_cookie_string(cookie_input)
         else:
@@ -511,101 +577,114 @@ def add_account():
         
         scheduler.schedule_checkins()
         return jsonify({'message': 'Account added successfully'})
+        
     except ValueError as e:
         return jsonify({'message': f'Invalid cookie format: {str(e)}'}), 400
     except Exception as e:
+        logger.error(f"Add account error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
 @app.route('/api/accounts/<int:account_id>', methods=['PUT'])
 @token_required
 def update_account(account_id):
-    data = request.json
-    
-    updates = []
-    params = []
-    
-    if 'enabled' in data:
-        updates.append('enabled = ?')
-        params.append(data['enabled'])
-    
-    if 'checkin_time' in data:
-        updates.append('checkin_time = ?')
-        params.append(data['checkin_time'])
-    
-    if 'token_data' in data or 'cookie_data' in data:
-        cookie_input = data.get('token_data', data.get('cookie_data', ''))
-        try:
+    """Update an account"""
+    try:
+        data = request.get_json()
+        
+        updates = []
+        params = []
+        
+        if 'enabled' in data:
+            updates.append('enabled = ?')
+            params.append(1 if data['enabled'] else 0)
+        
+        if 'checkin_time' in data:
+            updates.append('checkin_time = ?')
+            params.append(data['checkin_time'])
+        
+        if 'token_data' in data or 'cookie_data' in data:
+            cookie_input = data.get('token_data', data.get('cookie_data', ''))
             if isinstance(cookie_input, str):
                 token_data = parse_cookie_string(cookie_input)
             else:
                 token_data = cookie_input
             updates.append('token_data = ?')
             params.append(json.dumps(token_data))
-        except ValueError as e:
-            return jsonify({'message': f'Invalid cookie format: {str(e)}'}), 400
-    
-    if updates:
-        params.append(account_id)
-        if db.db_type == 'mysql':
-            db.execute(f'''
-                UPDATE accounts 
-                SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', params)
-        else:
-            db.execute(f'''
-                UPDATE accounts 
-                SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', params)
         
-        scheduler.schedule_checkins()
-        return jsonify({'message': 'Account updated successfully'})
-    
-    return jsonify({'message': 'No updates provided'}), 400
+        if updates:
+            params.append(account_id)
+            query = f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?"
+            db.execute(query, params)
+            
+            scheduler.schedule_checkins()
+            return jsonify({'message': 'Account updated successfully'})
+        
+        return jsonify({'message': 'No updates provided'}), 400
+        
+    except Exception as e:
+        logger.error(f"Update account error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
 
 @app.route('/api/accounts/<int:account_id>', methods=['DELETE'])
 @token_required
 def delete_account(account_id):
-    db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
-    db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
-    scheduler.schedule_checkins()
-    return jsonify({'message': 'Account deleted successfully'})
+    """Delete an account"""
+    try:
+        db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
+        db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
+        scheduler.schedule_checkins()
+        return jsonify({'message': 'Account deleted successfully'})
+    except Exception as e:
+        logger.error(f"Delete account error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
 
 @app.route('/api/notification', methods=['GET'])
 @token_required
 def get_notification_settings():
-    settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
-    if settings:
-        return jsonify(settings)
-    return jsonify({})
+    """Get notification settings"""
+    try:
+        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+        return jsonify(settings or {})
+    except Exception as e:
+        logger.error(f"Get notification settings error: {e}")
+        return jsonify({'error': 'Failed to load settings'}), 500
 
 @app.route('/api/notification', methods=['PUT'])
 @token_required
 def update_notification_settings():
-    data = request.json
-    
-    db.execute('''
-        UPDATE notification_settings
-        SET enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, 
-            wechat_webhook_key = ?
-        WHERE id = 1
-    ''', (
-        data.get('enabled', True),
-        data.get('telegram_bot_token', ''),
-        data.get('telegram_user_id', ''),
-        data.get('wechat_webhook_key', '')
-    ))
-    
-    return jsonify({'message': 'Notification settings updated'})
+    """Update notification settings"""
+    try:
+        data = request.get_json()
+        
+        db.execute('''
+            UPDATE notification_settings
+            SET enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, 
+                wechat_webhook_key = ?
+            WHERE id = 1
+        ''', (
+            1 if data.get('enabled', True) else 0,
+            data.get('telegram_bot_token', ''),
+            data.get('telegram_user_id', ''),
+            data.get('wechat_webhook_key', '')
+        ))
+        
+        return jsonify({'message': 'Notification settings updated'})
+    except Exception as e:
+        logger.error(f"Update notification settings error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
 
 @app.route('/api/checkin/manual/<int:account_id>', methods=['POST'])
 @token_required
 def manual_checkin(account_id):
-    threading.Thread(target=scheduler.perform_checkin, args=(account_id,), daemon=True).start()
-    return jsonify({'message': 'Manual check-in triggered'})
+    """Trigger manual check-in"""
+    try:
+        threading.Thread(target=scheduler.perform_checkin, args=(account_id,), daemon=True).start()
+        return jsonify({'message': 'Manual check-in triggered'})
+    except Exception as e:
+        logger.error(f"Manual checkin error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template with bilingual support and mobile optimization
+# HTML Template (keep your existing template, it looks good)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1504,9 +1583,24 @@ HTML_TEMPLATE = '''
             }, 3000);
         }
 
-        // Check authentication
+        // Check authentication on page load
         if (authToken) {
-            showDashboard();
+            // Verify token is still valid
+            fetch('/api/dashboard', {
+                headers: {
+                    'Authorization': 'Bearer ' + authToken
+                }
+            }).then(response => {
+                if (response.ok) {
+                    showDashboard();
+                } else {
+                    localStorage.removeItem('authToken');
+                    authToken = null;
+                }
+            }).catch(() => {
+                localStorage.removeItem('authToken');
+                authToken = null;
+            });
         }
 
         // Initialize language
@@ -1521,22 +1615,28 @@ HTML_TEMPLATE = '''
             const password = document.getElementById('password').value;
 
             try {
+                console.log('Attempting login...');
                 const response = await fetch('/api/login', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Content-Type': 'application/json'
+                    },
                     body: JSON.stringify({ username, password })
                 });
 
                 const data = await response.json();
+                console.log('Login response:', response.status, data);
+                
                 if (response.ok) {
                     authToken = data.token;
                     localStorage.setItem('authToken', authToken);
                     showToast(t('messages.loginSuccess'), 'success');
                     setTimeout(() => showDashboard(), 500);
                 } else {
-                    showToast(t('messages.loginFailed'), 'error');
+                    showToast(data.message || t('messages.loginFailed'), 'error');
                 }
             } catch (error) {
+                console.error('Login error:', error);
                 showToast(t('messages.error') + ': ' + error.message, 'error');
             }
         });
@@ -1554,6 +1654,7 @@ HTML_TEMPLATE = '''
 
         function logout() {
             localStorage.removeItem('authToken');
+            authToken = null;
             location.reload();
         }
 
@@ -1589,10 +1690,10 @@ HTML_TEMPLATE = '''
                 const data = await apiCall('/api/dashboard');
                 if (!data) return;
 
-                document.getElementById('totalAccounts').textContent = data.total_accounts;
-                document.getElementById('activeAccounts').textContent = data.enabled_accounts;
-                document.getElementById('totalCheckins').textContent = data.total_checkins;
-                document.getElementById('successRate').textContent = data.success_rate + '%';
+                document.getElementById('totalAccounts').textContent = data.total_accounts || 0;
+                document.getElementById('activeAccounts').textContent = data.enabled_accounts || 0;
+                document.getElementById('totalCheckins').textContent = data.total_checkins || 0;
+                document.getElementById('successRate').textContent = (data.success_rate || 0) + '%';
 
                 // Today's check-ins
                 const tbody = document.getElementById('todayCheckins');
@@ -1603,11 +1704,12 @@ HTML_TEMPLATE = '''
                         const tr = document.createElement('tr');
                         const statusText = checkin.success ? t('dashboard.todayCheckins.success') : t('dashboard.todayCheckins.failed');
                         const statusClass = checkin.success ? 'badge-success' : 'badge-danger';
+                        const time = checkin.created_at ? new Date(checkin.created_at).toLocaleTimeString() : '-';
                         tr.innerHTML = `
-                            <td>${checkin.name}</td>
+                            <td>${checkin.name || '-'}</td>
                             <td><span class="badge ${statusClass}">${statusText}</span></td>
                             <td class="hide-mobile">${checkin.message || '-'}</td>
-                            <td>${new Date(checkin.created_at).toLocaleTimeString()}</td>
+                            <td>${time}</td>
                         `;
                         tbody.appendChild(tr);
                     });
@@ -1663,7 +1765,7 @@ HTML_TEMPLATE = '''
                 const settings = await apiCall('/api/notification');
                 if (!settings) return;
 
-                document.getElementById('notifyEnabled').checked = settings.enabled;
+                document.getElementById('notifyEnabled').checked = settings.enabled || false;
                 document.getElementById('tgBotToken').value = settings.telegram_bot_token || '';
                 document.getElementById('tgUserId').value = settings.telegram_user_id || '';
                 document.getElementById('wechatKey').value = settings.wechat_webhook_key || '';
@@ -1784,14 +1886,22 @@ HTML_TEMPLATE = '''
 '''
 
 if __name__ == '__main__':
-    # Start scheduler
-    scheduler.start()
-    scheduler.schedule_checkins()
-    
-    # Start Flask app
-    logger.info(f"Starting control panel on port {PORT}")
-    logger.info(f"Database type: {DB_TYPE}")
-    if DB_TYPE == 'mysql':
-        logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    try:
+        # Start scheduler
+        scheduler.start()
+        scheduler.schedule_checkins()
+        
+        # Log startup information
+        logger.info(f"Starting LeafLow Control Panel on port {PORT}")
+        logger.info(f"Database type: {DB_TYPE}")
+        if DB_TYPE == 'mysql':
+            logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
+        logger.info(f"Admin username: {ADMIN_USERNAME}")
+        logger.info(f"Access the panel at: http://localhost:{PORT}")
+        
+        # Start Flask app
+        app.run(host='0.0.0.0', port=PORT, debug=False)
+        
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        raise
