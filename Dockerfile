@@ -1,34 +1,34 @@
-# 使用官方Python运行时作为基础镜像
+# Use official Python runtime as base image
 FROM python:3.9-slim
 
-# 设置工作目录
+# Set working directory
 WORKDIR /app
 
-# 安装系统依赖（cryptography需要的编译工具）
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     python3-dev \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制项目文件
+# Copy project files
 COPY requirements.txt .
 COPY app.py .
 
-# 安装Python依赖
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 创建数据目录
+# Create data directory
 RUN mkdir -p /app/data
 
-# 设置环境变量默认值
+# Set environment variable defaults
 ENV PORT=8181
 ENV ADMIN_USERNAME=admin
 ENV ADMIN_PASSWORD=admin123
 ENV JWT_SECRET_KEY=""
 
-# 暴露端口
+# Expose port
 EXPOSE 8181
 
-# 启动控制面板
+# Start control panel
 CMD ["python3", "app.py"]
