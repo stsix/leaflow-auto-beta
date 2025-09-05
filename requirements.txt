@@ -1,0 +1,7 @@
+requests>=2.25.1
+flask>=2.0.0
+flask-cors>=3.0.10
+PyJWT>=2.4.0
+schedule>=1.1.0
+pymysql>=1.0.2
+cryptography>=3.4.8
