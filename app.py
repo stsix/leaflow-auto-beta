@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LeafLow Auto Check-in Control Panel
+Leaflow Auto Check-in Control Panel
 Web-based management interface for the check-in system
 """
 
@@ -392,7 +392,7 @@ class NotificationService:
         except Exception as e:
             logger.error(f"WeChat Work notification error: {e}")
 
-# LeafLow check-in class
+# Leaflow check-in class
 class LeafLowCheckin:
     def __init__(self):
         self.checkin_url = "https://checkin.leaflow.net"
@@ -709,7 +709,7 @@ class CheckinScheduler:
             logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
             
             # Send notification
-            notification_title = f"LeafLow Check-in Result - {account['name']}"
+            notification_title = f"Leaflow Check-in Result - {account['name']}"
             notification_content = f"Status: {'✅ Success' if success else '❌ Failed'}\nMessage: {message}"
             NotificationService.send_notification(notification_title, notification_content)
             
@@ -721,7 +721,7 @@ class CheckinScheduler:
                 account = db.fetchone('SELECT name FROM accounts WHERE id = ?', (account_id,))
                 if account:
                     NotificationService.send_notification(
-                        f"LeafLow Check-in Error - {account['name']}",
+                        f"Leaflow Check-in Error - {account['name']}",
                         f"Error: {str(e)}"
                     )
             except:
@@ -1002,7 +1002,7 @@ def test_notification():
     try:
         NotificationService.send_notification(
             "Test Notification",
-            "This is a test notification from LeafLow Auto Check-in System. If you receive this, your notification settings are working correctly!"
+            "This is a test notification from Leaflow Auto Check-in System. If you receive this, your notification settings are working correctly!"
         )
         return jsonify({'message': 'Test notification sent'})
     except Exception as e:
@@ -1016,7 +1016,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>LeafLow Auto Check-in Control Panel</title>
+    <title>Leaflow Auto Check-in Control Panel</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -1464,7 +1464,7 @@ HTML_TEMPLATE = '''
         <div class="container">
             <div class="header">
                 <div class="header-content">
-                    <h1>📊 LeafLow 自动签到控制面板</h1>
+                    <h1>📊 Leaflow 自动签到控制面板</h1>
                     <div class="header-actions">
                         <button class="btn btn-danger btn-sm" onclick="logout()">退出</button>
                     </div>
@@ -1964,7 +1964,7 @@ if __name__ == '__main__':
         scheduler.schedule_checkins()
         
         # Log startup information
-        logger.info(f"Starting LeafLow Control Panel on port {PORT}")
+        logger.info(f"Starting Leaflow Control Panel on port {PORT}")
         logger.info(f"Database type: {DB_TYPE}")
         if DB_TYPE == 'mysql':
             logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
