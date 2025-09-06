@@ -33,6 +33,47 @@ docker run -d \
   -v /path/to/data:/app/data \
   ghcr.io/stsix/leaflow-auto-beta:latest
 ```
+### leaflow部署
+访问[部署清单](https://leaflow.net/apply)，复制下面内容并修改环境变量等配置，粘贴到输入 YAML 配置文本框内，然后点击下方 应用/更新 按钮即可自动部署，部署后自行到服务管理内创建服务并设置外网访问
+```
+kind: Deployment
+name: leaflow-auto
+replicas: 1
+image_pull_secrets: []
+labels: {}
+containers:
+  - name: leaflow-auto
+    image: ghcr.io/stsix/leaflow-auto-beta
+    working_dir: ''
+    command: []
+    args: []
+    ports:
+      - name: leaflow-auto
+        container_port: 8181
+        protocol: TCP
+    env:
+      - name: PORT
+        value: '8181，默认为8181'
+      - name: ADMIN_USERNAME
+        value: 管理员用户名
+      - name: ADMIN_PASSWORD
+        value: 管理员密码
+      - name: JWT_SECRET_KEY
+        value: JWT安全密钥
+      - name: MYSQL_DSN
+        value: mysql://username:password@host:port/dbname
+    env_from_configmap: []
+    env_from_secret: []
+    resources:
+    #（这里实测单账户 128M、50毫核即可运行，可根据实际情况调整）
+      cpu: 50
+      memory: 128
+      ephemeral_storage: 1024
+    volume_mounts: []
+    configmap_mounts: []
+    secret_mounts: []
+init_containers: []
+```
 
 ### 环境变量配置
 
