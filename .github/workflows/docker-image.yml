@@ -35,7 +35,7 @@ jobs:
       with:
         registry: ${{ env.REGISTRY }}
         username: ${{ github.actor }}
-        password: echo "current_timestamp=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: 提取元数据
       id: meta
