@@ -22,7 +22,7 @@ Leaflow 自动签到控制面板是一个基于 Web 的管理界面，用于自�
 
 ```bash
 # 拉取最新镜像
-docker pull ghcr.io/stsix/leaflow-auto-beta:latest
+docker pull ghcr.io/eraycc/leaflow-auto:20250906071735
 
 # 运行容器
 docker run -d \
@@ -31,7 +31,7 @@ docker run -d \
   -e ADMIN_USERNAME=admin \
   -e ADMIN_PASSWORD=your_secure_password \
   -v /path/to/data:/app/data \
-  ghcr.io/stsix/leaflow-auto-beta:latest
+  ghcr.io/eraycc/leaflow-auto:20250906071735
 ```
 ### leaflow部署
 访问[部署清单](https://leaflow.net/apply)，复制下面内容并修改环境变量等配置，粘贴到输入 YAML 配置文本框内，然后点击下方 应用/更新 按钮即可自动部署，部署后自行到服务管理内创建服务并设置外网访问
@@ -43,7 +43,7 @@ image_pull_secrets: []
 labels: {}
 containers:
   - name: leaflow-auto
-    image: ghcr.io/stsix/leaflow-auto-beta
+    image: ghcr.io/eraycc/leaflow-auto:20250906071735
     working_dir: ''
     command: []
     args: []
