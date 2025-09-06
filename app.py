@@ -14,6 +14,7 @@ import threading
 import schedule
 import time
 import re
+import requests
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, make_response
@@ -37,10 +38,6 @@ PORT = int(os.getenv('PORT', '8181'))
 def parse_mysql_dsn(dsn):
     """Parse MySQL DSN string"""
     try:
-        # Support multiple DSN formats
-        # Format 1: mysql://user:password@host:port/database
-        # Format 2: mysql://username.instance:password@host:port/database
-        
         parsed = urlparse(dsn)
         
         if parsed.scheme not in ['mysql', 'mysql+pymysql']:
@@ -54,12 +51,9 @@ def parse_mysql_dsn(dsn):
             'password': unquote(parsed.password) if parsed.password else ''
         }
         
-        # Handle special username formats
         username = unquote(parsed.username) if parsed.username else 'root'
         
-        # Check if username contains instance prefix (e.g., "4CLAMfGH5AQqJym.root")
         if '.' in username:
-            # Take the part after the last dot as the actual username
             username = username.split('.')[-1]
         
         config['user'] = username
@@ -84,7 +78,6 @@ if db_config:
     DB_USER = db_config['user']
     DB_PASSWORD = db_config['password']
 else:
-    # Default to SQLite
     DB_TYPE = 'sqlite'
     DB_HOST = 'localhost'
     DB_PORT = 3306
@@ -136,7 +129,6 @@ class Database:
                 logger.info("Successfully connected to SQLite database")
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
-            # Fallback to SQLite if MySQL fails
             if DB_TYPE == 'mysql':
                 logger.info("Falling back to SQLite database")
                 os.makedirs('/app/data', exist_ok=True)
@@ -182,18 +174,24 @@ class Database:
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS notification_settings (
                             id INT AUTO_INCREMENT PRIMARY KEY,
-                            enabled BOOLEAN DEFAULT TRUE,
-                            telegram_bot_token TEXT,
-                            telegram_user_id TEXT,
-                            wechat_webhook_key TEXT,
+                            enabled BOOLEAN DEFAULT FALSE,
+                            telegram_bot_token VARCHAR(255) DEFAULT '',
+                            telegram_user_id VARCHAR(255) DEFAULT '',
+                            wechat_webhook_key VARCHAR(255) DEFAULT '',
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                         )
                     ''')
                     
-                    # Check if notification settings exist
                     cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
                     result = cursor.fetchone()
                     count = result[0] if isinstance(result, tuple) else result['cnt']
+                    
+                    if count == 0:
+                        cursor.execute('''
+                            INSERT INTO notification_settings 
+                            (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
+                            VALUES (FALSE, '', '', '')
+                        ''')
                     
                 else:
                     # SQLite table creation
@@ -229,10 +227,10 @@ class Database:
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS notification_settings (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            enabled BOOLEAN DEFAULT 1,
-                            telegram_bot_token TEXT,
-                            telegram_user_id TEXT,
-                            wechat_webhook_key TEXT,
+                            enabled BOOLEAN DEFAULT 0,
+                            telegram_bot_token TEXT DEFAULT '',
+                            telegram_user_id TEXT DEFAULT '',
+                            wechat_webhook_key TEXT DEFAULT '',
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     ''')
@@ -240,21 +238,13 @@ class Database:
                     cursor.execute('SELECT COUNT(*) as count FROM notification_settings')
                     result = cursor.fetchone()
                     count = result['count'] if hasattr(result, '__getitem__') else 0
-                
-                # Initialize notification settings if not exists
-                if count == 0:
-                    if self.db_type == 'mysql':
+                    
+                    if count == 0:
                         cursor.execute('''
                             INSERT INTO notification_settings 
                             (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
-                            VALUES (%s, %s, %s, %s)
-                        ''', (True, '', '', ''))
-                    else:
-                        cursor.execute('''
-                            INSERT INTO notification_settings 
-                            (enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
-                            VALUES (?, ?, ?, ?)
-                        ''', (1, '', '', ''))
+                            VALUES (0, '', '', '')
+                        ''')
                         self.conn.commit()
                 
                 logger.info("Database tables initialized successfully")
@@ -267,13 +257,11 @@ class Database:
         """Execute a database query"""
         with self.lock:
             try:
-                # Check connection and reconnect if needed
                 if self.db_type == 'mysql':
                     self.conn.ping(reconnect=True)
                 
                 cursor = self.conn.cursor()
                 
-                # Convert ? to %s for MySQL
                 if self.db_type == 'mysql' and query:
                     query = query.replace('?', '%s')
                 
@@ -288,7 +276,6 @@ class Database:
                 return cursor
             except Exception as e:
                 logger.error(f"Database execute error: {e}")
-                # Try to reconnect
                 if self.db_type == 'mysql':
                     self.connect()
                 raise
@@ -300,13 +287,11 @@ class Database:
         
         if result:
             if self.db_type == 'mysql':
-                # Convert MySQL result to dict
                 if cursor.description:
                     columns = [desc[0] for desc in cursor.description]
                     if isinstance(result, tuple):
                         return dict(zip(columns, result))
             elif self.db_type == 'sqlite':
-                # SQLite with row_factory returns Row objects
                 return dict(result) if result else None
         
         return result
@@ -318,12 +303,10 @@ class Database:
         
         if results:
             if self.db_type == 'mysql':
-                # Convert MySQL results to list of dicts
                 if cursor.description:
                     columns = [desc[0] for desc in cursor.description]
                     return [dict(zip(columns, row)) for row in results]
             elif self.db_type == 'sqlite':
-                # Convert SQLite Row objects to dicts
                 return [dict(row) for row in results]
         
         return results or []
@@ -334,6 +317,268 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize database: {e}")
     raise
+
+# Notification class
+class NotificationService:
+    @staticmethod
+    def send_notification(title, content):
+        """Send notification through configured channels"""
+        try:
+            settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+            if not settings or not settings.get('enabled'):
+                logger.info("Notifications disabled")
+                return
+            
+            # Send Telegram notification
+            if settings.get('telegram_bot_token') and settings.get('telegram_user_id'):
+                NotificationService.send_telegram(
+                    settings['telegram_bot_token'],
+                    settings['telegram_user_id'],
+                    title,
+                    content
+                )
+            
+            # Send WeChat Work notification
+            if settings.get('wechat_webhook_key'):
+                NotificationService.send_wechat(
+                    settings['wechat_webhook_key'],
+                    title,
+                    content
+                )
+                
+        except Exception as e:
+            logger.error(f"Notification error: {e}")
+    
+    @staticmethod
+    def send_telegram(token, chat_id, title, content):
+        """Send Telegram notification"""
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            data = {
+                "chat_id": chat_id,
+                "text": f"{title}\n\n{content}",
+                "disable_web_page_preview": True
+            }
+            
+            response = requests.post(url=url, data=data, timeout=30)
+            result = response.json()
+            
+            if result.get("ok"):
+                logger.info("Telegram notification sent successfully")
+            else:
+                logger.error(f"Telegram notification failed: {result.get('description')}")
+        except Exception as e:
+            logger.error(f"Telegram notification error: {e}")
+    
+    @staticmethod
+    def send_wechat(webhook_key, title, content):
+        """Send WeChat Work notification"""
+        try:
+            url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={webhook_key}"
+            headers = {"Content-Type": "application/json;charset=utf-8"}
+            data = {"msgtype": "text", "text": {"content": f"{title}\n\n{content}"}}
+            
+            response = requests.post(
+                url=url, 
+                data=json.dumps(data), 
+                headers=headers, 
+                timeout=15
+            ).json()
+
+            if response.get("errcode") == 0:
+                logger.info("WeChat Work notification sent successfully")
+            else:
+                logger.error(f"WeChat Work notification failed: {response.get('errmsg')}")
+        except Exception as e:
+            logger.error(f"WeChat Work notification error: {e}")
+
+# LeafLow check-in class
+class LeafLowCheckin:
+    def __init__(self):
+        self.checkin_url = "https://checkin.leaflow.net"
+        self.main_site = "https://leaflow.net"
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    
+    def create_session(self, token_data):
+        """Create session with authentication"""
+        session = requests.Session()
+        
+        session.headers.update({
+            'User-Agent': self.user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+        
+        if 'cookies' in token_data:
+            for name, value in token_data['cookies'].items():
+                session.cookies.set(name, value)
+        
+        if 'headers' in token_data:
+            session.headers.update(token_data['headers'])
+        
+        return session
+    
+    def test_authentication(self, session, account_name):
+        """Test if authentication is valid"""
+        try:
+            test_urls = [
+                f"{self.main_site}/dashboard",
+                f"{self.main_site}/profile",
+                f"{self.main_site}/user",
+                self.checkin_url,
+            ]
+            
+            for url in test_urls:
+                response = session.get(url, timeout=30)
+                
+                if response.status_code == 200:
+                    content = response.text.lower()
+                    if any(indicator in content for indicator in ['dashboard', 'profile', 'user', 'logout', 'welcome']):
+                        logger.info(f"✅ [{account_name}] Authentication valid")
+                        return True, "Authentication successful"
+                elif response.status_code in [301, 302, 303]:
+                    location = response.headers.get('location', '')
+                    if 'login' not in location.lower():
+                        logger.info(f"✅ [{account_name}] Authentication valid (redirect)")
+                        return True, "Authentication successful (redirect)"
+            
+            return False, "Authentication failed - no valid authenticated pages found"
+            
+        except Exception as e:
+            return False, f"Authentication test error: {str(e)}"
+    
+    def perform_checkin(self, session, account_name):
+        """Perform check-in"""
+        logger.info(f"🎯 [{account_name}] Performing checkin...")
+        
+        try:
+            # Try direct check-in page
+            response = session.get(self.checkin_url, timeout=30)
+            
+            if response.status_code == 200:
+                result = self.analyze_and_checkin(session, response.text, self.checkin_url, account_name)
+                if result[0]:
+                    return result
+            
+            # Try API endpoints
+            api_endpoints = [
+                f"{self.checkin_url}/api/checkin",
+                f"{self.checkin_url}/checkin",
+                f"{self.main_site}/api/checkin",
+                f"{self.main_site}/checkin"
+            ]
+            
+            for endpoint in api_endpoints:
+                try:
+                    # GET request
+                    response = session.get(endpoint, timeout=30)
+                    if response.status_code == 200:
+                        success, message = self.check_checkin_response(response.text)
+                        if success:
+                            return True, message
+                    
+                    # POST request
+                    response = session.post(endpoint, data={'checkin': '1'}, timeout=30)
+                    if response.status_code == 200:
+                        success, message = self.check_checkin_response(response.text)
+                        if success:
+                            return True, message
+                            
+                except Exception as e:
+                    logger.debug(f"[{account_name}] API endpoint {endpoint} failed: {str(e)}")
+                    continue
+            
+            return False, "All checkin methods failed"
+            
+        except Exception as e:
+            return False, f"Checkin error: {str(e)}"
+    
+    def analyze_and_checkin(self, session, html_content, page_url, account_name):
+        """Analyze page and perform check-in"""
+        if self.already_checked_in(html_content):
+            return True, "Already checked in today"
+        
+        if not self.is_checkin_page(html_content):
+            return False, "Not a checkin page"
+        
+        try:
+            checkin_data = {'checkin': '1', 'action': 'checkin', 'daily': '1'}
+            
+            csrf_token = self.extract_csrf_token(html_content)
+            if csrf_token:
+                checkin_data['_token'] = csrf_token
+                checkin_data['csrf_token'] = csrf_token
+            
+            response = session.post(page_url, data=checkin_data, timeout=30)
+            
+            if response.status_code == 200:
+                return self.check_checkin_response(response.text)
+                
+        except Exception as e:
+            logger.debug(f"[{account_name}] POST checkin failed: {str(e)}")
+        
+        return False, "Failed to perform checkin"
+    
+    def already_checked_in(self, html_content):
+        """Check if already checked in"""
+        content_lower = html_content.lower()
+        indicators = [
+            'already checked in', '今日已签到', 'checked in today',
+            'attendance recorded', '已完成签到', 'completed today'
+        ]
+        return any(indicator in content_lower for indicator in indicators)
+    
+    def is_checkin_page(self, html_content):
+        """Check if it's a check-in page"""
+        content_lower = html_content.lower()
+        indicators = ['check-in', 'checkin', '签到', 'attendance', 'daily']
+        return any(indicator in content_lower for indicator in indicators)
+    
+    def extract_csrf_token(self, html_content):
+        """Extract CSRF token"""
+        patterns = [
+            r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+            r'name=["\']csrf_token["\'][^>]*value=["\']([^"\']+)["\']',
+            r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, html_content, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    def check_checkin_response(self, html_content):
+        """Check check-in response"""
+        content_lower = html_content.lower()
+        
+        success_indicators = [
+            'check-in successful', 'checkin successful', '签到成功',
+            'attendance recorded', 'earned reward', '获得奖励',
+            'success', '成功', 'completed'
+        ]
+        
+        if any(indicator in content_lower for indicator in success_indicators):
+            reward_patterns = [
+                r'获得奖励[^\d]*(\d+\.?\d*)\s*元',
+                r'earned.*?(\d+\.?\d*)\s*(credits?|points?)',
+                r'(\d+\.?\d*)\s*(credits?|points?|元)'
+            ]
+            
+            for pattern in reward_patterns:
+                match = re.search(pattern, html_content, re.IGNORECASE)
+                if match:
+                    reward = match.group(1)
+                    return True, f"Check-in successful! Earned {reward} credits"
+            
+            return True, "Check-in successful!"
+        
+        return False, "Checkin response indicates failure"
 
 # Helper function to parse cookie string
 def parse_cookie_string(cookie_input):
@@ -392,11 +637,12 @@ def token_required(f):
     
     return decorated
 
-# Scheduler class (simplified for now)
+# Scheduler class
 class CheckinScheduler:
     def __init__(self):
         self.scheduler_thread = None
         self.running = False
+        self.leaflow_checkin = LeafLowCheckin()
     
     def start(self):
         if not self.running:
@@ -439,19 +685,47 @@ class CheckinScheduler:
             delay = random.randint(30, 60)
             time.sleep(delay)
             
-            # Record check-in attempt (placeholder for actual check-in logic)
-            success = random.choice([True, False])  # Simulated result
-            message = "Check-in successful" if success else "Check-in failed"
+            # Parse token data
+            token_data = json.loads(account['token_data'])
             
+            # Create session and perform check-in
+            session = self.leaflow_checkin.create_session(token_data)
+            
+            # Test authentication
+            auth_result = self.leaflow_checkin.test_authentication(session, account['name'])
+            if not auth_result[0]:
+                success = False
+                message = f"Authentication failed: {auth_result[1]}"
+            else:
+                # Perform check-in
+                success, message = self.leaflow_checkin.perform_checkin(session, account['name'])
+            
+            # Record check-in result
             db.execute('''
                 INSERT INTO checkin_history (account_id, success, message, checkin_date)
                 VALUES (?, ?, ?, ?)
             ''', (account_id, success, message, datetime.now().date()))
             
-            logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'}")
+            logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
+            
+            # Send notification
+            notification_title = f"LeafLow Check-in Result - {account['name']}"
+            notification_content = f"Status: {'✅ Success' if success else '❌ Failed'}\nMessage: {message}"
+            NotificationService.send_notification(notification_title, notification_content)
             
         except Exception as e:
             logger.error(f"Check-in error for account {account_id}: {e}")
+            
+            # Send error notification
+            try:
+                account = db.fetchone('SELECT name FROM accounts WHERE id = ?', (account_id,))
+                if account:
+                    NotificationService.send_notification(
+                        f"LeafLow Check-in Error - {account['name']}",
+                        f"Error: {str(e)}"
+                    )
+            except:
+                pass
 
 scheduler = CheckinScheduler()
 
@@ -465,7 +739,6 @@ def index():
 def login():
     """Handle login requests"""
     if request.method == 'OPTIONS':
-        # Handle preflight request
         response = make_response()
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
@@ -503,11 +776,9 @@ def login():
 def dashboard():
     """Get dashboard statistics"""
     try:
-        # Get statistics
         total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts')
         enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1')
         
-        # Today's check-ins
         today = datetime.now().date()
         today_checkins = db.fetchall('''
             SELECT a.name, ch.success, ch.message, ch.created_at
@@ -518,11 +789,9 @@ def dashboard():
             LIMIT 20
         ''', (today,))
         
-        # Overall statistics
         total_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history')
         successful_checkins = db.fetchone('SELECT COUNT(*) as count FROM checkin_history WHERE success = 1')
         
-        # Calculate success rate
         total_count = total_checkins['count'] if total_checkins else 0
         success_count = successful_checkins['count'] if successful_checkins else 0
         success_rate = round(success_count / total_count * 100, 2) if total_count > 0 else 0
@@ -644,7 +913,23 @@ def get_notification_settings():
     """Get notification settings"""
     try:
         settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
-        return jsonify(settings or {})
+        if settings:
+            settings['enabled'] = bool(settings.get('enabled', 0))
+            settings['telegram_bot_token'] = settings.get('telegram_bot_token', '') or ''
+            settings['telegram_user_id'] = settings.get('telegram_user_id', '') or ''
+            settings['wechat_webhook_key'] = settings.get('wechat_webhook_key', '') or ''
+            
+            logger.info(f"Loaded notification settings: {settings}")
+            return jsonify(settings)
+        else:
+            default_settings = {
+                'id': 1,
+                'enabled': False,
+                'telegram_bot_token': '',
+                'telegram_user_id': '',
+                'wechat_webhook_key': ''
+            }
+            return jsonify(default_settings)
     except Exception as e:
         logger.error(f"Get notification settings error: {e}")
         return jsonify({'error': 'Failed to load settings'}), 500
@@ -655,20 +940,46 @@ def update_notification_settings():
     """Update notification settings"""
     try:
         data = request.get_json()
+        logger.info(f"Updating notification settings with data: {data}")
         
-        db.execute('''
-            UPDATE notification_settings
-            SET enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, 
-                wechat_webhook_key = ?
-            WHERE id = 1
-        ''', (
-            1 if data.get('enabled', True) else 0,
-            data.get('telegram_bot_token', ''),
-            data.get('telegram_user_id', ''),
-            data.get('wechat_webhook_key', '')
-        ))
+        enabled = 1 if data.get('enabled', False) else 0
+        telegram_bot_token = data.get('telegram_bot_token', '') or ''
+        telegram_user_id = data.get('telegram_user_id', '') or ''
+        wechat_webhook_key = data.get('wechat_webhook_key', '') or ''
         
-        return jsonify({'message': 'Notification settings updated'})
+        existing = db.fetchone('SELECT id FROM notification_settings WHERE id = 1')
+        
+        if existing:
+            db.execute('''
+                UPDATE notification_settings
+                SET enabled = ?, telegram_bot_token = ?, telegram_user_id = ?, 
+                    wechat_webhook_key = ?, updated_at = ?
+                WHERE id = 1
+            ''', (
+                enabled,
+                telegram_bot_token,
+                telegram_user_id,
+                wechat_webhook_key,
+                datetime.now()
+            ))
+            logger.info("Notification settings updated successfully")
+        else:
+            db.execute('''
+                INSERT INTO notification_settings 
+                (id, enabled, telegram_bot_token, telegram_user_id, wechat_webhook_key)
+                VALUES (1, ?, ?, ?, ?)
+            ''', (
+                enabled,
+                telegram_bot_token,
+                telegram_user_id,
+                wechat_webhook_key
+            ))
+            logger.info("Notification settings created successfully")
+        
+        updated_settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
+        logger.info(f"Verified settings after update: {updated_settings}")
+        
+        return jsonify({'message': 'Notification settings updated successfully'})
     except Exception as e:
         logger.error(f"Update notification settings error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
@@ -684,7 +995,21 @@ def manual_checkin(account_id):
         logger.error(f"Manual checkin error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template
+@app.route('/api/test/notification', methods=['POST'])
+@token_required
+def test_notification():
+    """Test notification settings"""
+    try:
+        NotificationService.send_notification(
+            "Test Notification",
+            "This is a test notification from LeafLow Auto Check-in System. If you receive this, your notification settings are working correctly!"
+        )
+        return jsonify({'message': 'Test notification sent'})
+    except Exception as e:
+        logger.error(f"Test notification error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
+
+# HTML Template (keeping the original with minor fixes)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -785,6 +1110,12 @@ HTML_TEMPLATE = '''
         }
         .btn-success:hover {
             box-shadow: 0 5px 15px rgba(72, 187, 120, 0.4);
+        }
+        .btn-info {
+            background: linear-gradient(135deg, #4299e1, #3182ce);
+        }
+        .btn-info:hover {
+            box-shadow: 0 5px 15px rgba(66, 153, 225, 0.4);
         }
         
         /* Dashboard Styles */
@@ -1096,6 +1427,13 @@ HTML_TEMPLATE = '''
             margin-top: 10px;
             display: none;
         }
+        
+        /* Cookie format hint */
+        .format-hint {
+            font-size: 12px;
+            color: #718096;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
@@ -1202,7 +1540,10 @@ HTML_TEMPLATE = '''
             </div>
 
             <div class="section">
-                <h2>🔔 通知设置</h2>
+                <div class="section-header">
+                    <h2>🔔 通知设置</h2>
+                    <button class="btn btn-info btn-sm" onclick="testNotification()">测试通知</button>
+                </div>
                 <div class="form-group">
                     <label>
                         <input type="checkbox" id="notifyEnabled"> 
@@ -1244,7 +1585,11 @@ HTML_TEMPLATE = '''
                 </div>
                 <div class="form-group">
                     <label>Cookie 数据</label>
-                    <textarea id="tokenData" rows="6" placeholder='{"cookies": {"key": "value"}} or key1=value1; key2=value2' required></textarea>
+                    <textarea id="tokenData" rows="6" placeholder='支持格式：
+1. JSON格式: {"cookies": {"key": "value"}}
+2. 分号分隔: key1=value1; key2=value2
+3. 完整cookie: leaflow_session=xxx; remember_xxx=xxx; XSRF-TOKEN=xxx' required></textarea>
+                    <div class="format-hint">从浏览器开发者工具(F12) → Network → 请求头 → Cookie 复制</div>
                 </div>
                 <div style="display: flex; gap: 10px; margin-top: 20px;">
                     <button type="button" class="btn btn-full" onclick="addAccount()">添加账号</button>
@@ -1258,9 +1603,6 @@ HTML_TEMPLATE = '''
         // 全局变量
         let authToken = localStorage.getItem('authToken');
         
-        // 调试：打印初始状态
-        console.log('Page loaded, authToken:', authToken ? 'exists' : 'not found');
-
         // Toast notification function
         function showToast(message, type = 'info') {
             const toast = document.getElementById('toast');
@@ -1283,10 +1625,8 @@ HTML_TEMPLATE = '''
             }, 5000);
         }
 
-        // 处理登录 - 使用普通函数而不是事件监听器
+        // 处理登录
         async function handleLogin() {
-            console.log('handleLogin called');
-            
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
             
@@ -1300,7 +1640,6 @@ HTML_TEMPLATE = '''
             loginBtn.textContent = '登录中...';
 
             try {
-                console.log('Sending login request...');
                 const response = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 
@@ -1309,20 +1648,16 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify({ username, password })
                 });
 
-                console.log('Response status:', response.status);
                 const data = await response.json();
-                console.log('Response data:', data);
                 
                 if (response.ok && data.token) {
                     authToken = data.token;
                     localStorage.setItem('authToken', authToken);
                     showToast('登录成功', 'success');
                     
-                    // 直接显示仪表板
                     document.getElementById('loginContainer').style.display = 'none';
                     document.getElementById('dashboard').style.display = 'block';
                     
-                    // 加载数据
                     loadDashboard();
                     loadAccounts();
                     loadNotificationSettings();
@@ -1340,9 +1675,6 @@ HTML_TEMPLATE = '''
 
         // 监听回车键
         document.addEventListener('DOMContentLoaded', function() {
-            console.log('DOM loaded');
-            
-            // 为输入框添加回车键监听
             document.getElementById('username').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
                     handleLogin();
@@ -1357,22 +1689,18 @@ HTML_TEMPLATE = '''
             
             // 检查是否已登录
             if (authToken) {
-                console.log('Checking existing token...');
-                // 验证 token 是否有效
                 fetch('/api/dashboard', {
                     headers: {
                         'Authorization': 'Bearer ' + authToken
                     }
                 }).then(response => {
                     if (response.ok) {
-                        console.log('Token valid, showing dashboard');
                         document.getElementById('loginContainer').style.display = 'none';
                         document.getElementById('dashboard').style.display = 'block';
                         loadDashboard();
                         loadAccounts();
                         loadNotificationSettings();
                     } else {
-                        console.log('Token invalid, clearing');
                         localStorage.removeItem('authToken');
                         authToken = null;
                     }
@@ -1427,7 +1755,6 @@ HTML_TEMPLATE = '''
                 document.getElementById('totalCheckins').textContent = data.total_checkins || 0;
                 document.getElementById('successRate').textContent = (data.success_rate || 0) + '%';
 
-                // Today's check-ins
                 const tbody = document.getElementById('todayCheckins');
                 tbody.innerHTML = '';
                 
@@ -1495,7 +1822,7 @@ HTML_TEMPLATE = '''
                 const settings = await apiCall('/api/notification');
                 if (!settings) return;
 
-                document.getElementById('notifyEnabled').checked = settings.enabled || false;
+                document.getElementById('notifyEnabled').checked = settings.enabled === true || settings.enabled === 1;
                 document.getElementById('tgBotToken').value = settings.telegram_bot_token || '';
                 document.getElementById('tgUserId').value = settings.telegram_user_id || '';
                 document.getElementById('wechatKey').value = settings.wechat_webhook_key || '';
@@ -1565,8 +1892,19 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify(settings)
                 });
                 showToast('设置保存成功', 'success');
+                
+                setTimeout(loadNotificationSettings, 500);
             } catch (error) {
-                showToast('操作失败', 'error');
+                showToast('操作失败: ' + error.message, 'error');
+            }
+        }
+
+        async function testNotification() {
+            try {
+                await apiCall('/api/test/notification', { method: 'POST' });
+                showToast('测试通知已发送', 'info');
+            } catch (error) {
+                showToast('发送失败: ' + error.message, 'error');
             }
         }
 
