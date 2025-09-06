@@ -15,7 +15,7 @@ import schedule
 import time
 import re
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, make_response
 from flask_cors import CORS
@@ -23,16 +23,21 @@ import jwt
 import logging
 from urllib.parse import urlparse, unquote
 import random
+import pytz  # 添加时区支持
 
 # Configuration
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32))
 CORS(app, supports_credentials=True)
 
+# 设置默认时区为东八区
+DEFAULT_TIMEZONE = pytz.timezone('Asia/Shanghai')
+
 # Environment variables
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
 PORT = int(os.getenv('PORT', '8181'))
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '60'))  # 默认60秒检查一次
 
 # Database configuration
 def parse_mysql_dsn(dsn):
@@ -152,11 +157,21 @@ class Database:
                             name VARCHAR(255) UNIQUE NOT NULL,
                             token_data TEXT NOT NULL,
                             enabled BOOLEAN DEFAULT TRUE,
-                            checkin_time VARCHAR(5) DEFAULT '01:00',
+                            checkin_time_start VARCHAR(5) DEFAULT '01:00',
+                            checkin_time_end VARCHAR(5) DEFAULT '01:30',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                         )
                     ''')
+                    
+                    # 检查并添加新列
+                    cursor.execute("SHOW COLUMNS FROM accounts LIKE 'checkin_time_start'")
+                    if not cursor.fetchone():
+                        cursor.execute("ALTER TABLE accounts ADD COLUMN checkin_time_start VARCHAR(5) DEFAULT '01:00'")
+                        cursor.execute("ALTER TABLE accounts ADD COLUMN checkin_time_end VARCHAR(5) DEFAULT '01:30'")
+                        # 迁移旧数据
+                        cursor.execute("UPDATE accounts SET checkin_time_start = checkin_time WHERE checkin_time IS NOT NULL")
+                        cursor.execute("UPDATE accounts SET checkin_time_end = TIME_FORMAT(ADDTIME(checkin_time, '00:30:00'), '%H:%i') WHERE checkin_time IS NOT NULL")
                     
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS checkin_history (
@@ -167,9 +182,25 @@ class Database:
                             checkin_date DATE NOT NULL,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                            INDEX idx_checkin_date (checkin_date)
+                            INDEX idx_checkin_date (checkin_date),
+                            INDEX idx_account_date (account_id, checkin_date)
                         )
                     ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS system_settings (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            check_interval INT DEFAULT 60,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('SELECT COUNT(*) as cnt FROM system_settings')
+                    result = cursor.fetchone()
+                    count = result[0] if isinstance(result, tuple) else result['cnt']
+                    
+                    if count == 0:
+                        cursor.execute('INSERT INTO system_settings (check_interval) VALUES (?)', (CHECK_INTERVAL,))
                     
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS notification_settings (
@@ -201,11 +232,23 @@ class Database:
                             name VARCHAR(255) UNIQUE NOT NULL,
                             token_data TEXT NOT NULL,
                             enabled BOOLEAN DEFAULT 1,
-                            checkin_time VARCHAR(5) DEFAULT '01:00',
+                            checkin_time_start VARCHAR(5) DEFAULT '01:00',
+                            checkin_time_end VARCHAR(5) DEFAULT '01:30',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     ''')
+                    
+                    # 检查并添加新列
+                    cursor.execute("PRAGMA table_info(accounts)")
+                    columns = [column[1] for column in cursor.fetchall()]
+                    
+                    if 'checkin_time_start' not in columns:
+                        cursor.execute("ALTER TABLE accounts ADD COLUMN checkin_time_start VARCHAR(5) DEFAULT '01:00'")
+                        cursor.execute("ALTER TABLE accounts ADD COLUMN checkin_time_end VARCHAR(5) DEFAULT '01:30'")
+                        # 迁移旧数据
+                        cursor.execute("UPDATE accounts SET checkin_time_start = checkin_time WHERE checkin_time IS NOT NULL")
+                        cursor.execute("UPDATE accounts SET checkin_time_end = time(checkin_time, '+30 minutes') WHERE checkin_time IS NOT NULL")
                     
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS checkin_history (
@@ -223,6 +266,27 @@ class Database:
                         CREATE INDEX IF NOT EXISTS idx_checkin_date 
                         ON checkin_history(checkin_date)
                     ''')
+                    
+                    cursor.execute('''
+                        CREATE INDEX IF NOT EXISTS idx_account_date 
+                        ON checkin_history(account_id, checkin_date)
+                    ''')
+                    
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS system_settings (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            check_interval INTEGER DEFAULT 60,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    
+                    cursor.execute('SELECT COUNT(*) as count FROM system_settings')
+                    result = cursor.fetchone()
+                    count = result['count'] if hasattr(result, '__getitem__') else 0
+                    
+                    if count == 0:
+                        cursor.execute('INSERT INTO system_settings (check_interval) VALUES (?)', (CHECK_INTERVAL,))
+                        self.conn.commit()
                     
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS notification_settings (
@@ -637,19 +701,22 @@ def token_required(f):
     
     return decorated
 
-# Scheduler class
+# Scheduler class with timezone support
 class CheckinScheduler:
     def __init__(self):
         self.scheduler_thread = None
         self.running = False
         self.leaflow_checkin = LeafLowCheckin()
+        self.check_interval = CHECK_INTERVAL
+        self.last_check_times = {}  # 记录每个账户的最后检查时间
     
     def start(self):
         if not self.running:
             self.running = True
+            self.load_check_interval()
             self.scheduler_thread = threading.Thread(target=self._run_scheduler, daemon=True)
             self.scheduler_thread.start()
-            logger.info("Scheduler started")
+            logger.info(f"Scheduler started with check interval: {self.check_interval} seconds")
     
     def stop(self):
         self.running = False
@@ -657,22 +724,131 @@ class CheckinScheduler:
             self.scheduler_thread.join(timeout=5)
         logger.info("Scheduler stopped")
     
-    def _run_scheduler(self):
-        while self.running:
-            schedule.run_pending()
-            time.sleep(60)
-    
-    def schedule_checkins(self):
+    def load_check_interval(self):
+        """从数据库加载检查间隔"""
         try:
-            schedule.clear()
-            accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
-            
-            for account in accounts:
-                checkin_time = account.get('checkin_time', '01:00')
-                schedule.every().day.at(checkin_time).do(self.perform_checkin, account['id'])
-                logger.info(f"Scheduled check-in for account {account['name']} at {checkin_time}")
+            settings = db.fetchone('SELECT check_interval FROM system_settings WHERE id = 1')
+            if settings:
+                self.check_interval = settings['check_interval']
+                logger.info(f"Loaded check interval: {self.check_interval} seconds")
         except Exception as e:
-            logger.error(f"Error scheduling checkins: {e}")
+            logger.error(f"Error loading check interval: {e}")
+    
+    def update_check_interval(self, interval):
+        """更新检查间隔"""
+        self.check_interval = interval
+        logger.info(f"Updated check interval to: {interval} seconds")
+    
+    def _run_scheduler(self):
+        """运行调度器"""
+        while self.running:
+            try:
+                # 获取当前东八区时间
+                now = datetime.now(DEFAULT_TIMEZONE)
+                current_time = now.strftime('%H:%M')
+                today = now.date()
+                
+                # 获取所有启用的账户
+                accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+                
+                for account in accounts:
+                    account_id = account['id']
+                    account_name = account['name']
+                    
+                    # 获取签到时间段
+                    time_start = account.get('checkin_time_start', '01:00')
+                    time_end = account.get('checkin_time_end', '01:30')
+                    
+                    # 检查是否在签到时间段内
+                    if self.is_in_time_range(current_time, time_start, time_end):
+                        # 检查今天是否已经签到过
+                        existing = db.fetchone('''
+                            SELECT id FROM checkin_history 
+                            WHERE account_id = ? AND checkin_date = ?
+                        ''', (account_id, today))
+                        
+                        if not existing:
+                            # 检查是否刚刚尝试过（避免频繁重试）
+                            last_check = self.last_check_times.get(account_id)
+                            if last_check:
+                                time_since_last = (now - last_check).total_seconds()
+                                if time_since_last < 300:  # 5分钟内不重试
+                                    continue
+                            
+                            logger.info(f"Account {account_name} is in checkin window ({time_start}-{time_end}), triggering checkin")
+                            self.last_check_times[account_id] = now
+                            
+                            # 随机延迟执行
+                            threading.Thread(
+                                target=self.perform_checkin_with_random_delay, 
+                                args=(account_id,), 
+                                daemon=True
+                            ).start()
+                
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
+            
+            # 按设定的间隔等待
+            time.sleep(self.check_interval)
+    
+    def is_in_time_range(self, current_time, start_time, end_time):
+        """检查当前时间是否在指定时间段内"""
+        try:
+            current = datetime.strptime(current_time, '%H:%M').time()
+            start = datetime.strptime(start_time, '%H:%M').time()
+            end = datetime.strptime(end_time, '%H:%M').time()
+            
+            if start <= end:
+                return start <= current <= end
+            else:
+                # 跨午夜的情况
+                return current >= start or current <= end
+        except Exception as e:
+            logger.error(f"Error checking time range: {e}")
+            return False
+    
+    def perform_checkin_with_random_delay(self, account_id):
+        """带随机延迟的签到"""
+        try:
+            account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
+            if not account:
+                return
+            
+            # 获取时间段
+            time_start = account.get('checkin_time_start', '01:00')
+            time_end = account.get('checkin_time_end', '01:30')
+            
+            # 计算时间段长度（分钟）
+            start_minutes = int(time_start.split(':')[0]) * 60 + int(time_start.split(':')[1])
+            end_minutes = int(time_end.split(':')[0]) * 60 + int(time_end.split(':')[1])
+            
+            if end_minutes < start_minutes:
+                end_minutes += 24 * 60  # 跨午夜
+            
+            window_minutes = end_minutes - start_minutes
+            
+            # 随机延迟（时间窗口的0-50%）
+            max_delay = min(int(window_minutes * 30), 600)  # 最多10分钟
+            delay = random.randint(0, max_delay)
+            
+            logger.info(f"Waiting {delay} seconds before check-in for {account['name']}")
+            time.sleep(delay)
+            
+            # 再次检查是否已签到（避免重复）
+            now = datetime.now(DEFAULT_TIMEZONE)
+            today = now.date()
+            existing = db.fetchone('''
+                SELECT id FROM checkin_history 
+                WHERE account_id = ? AND checkin_date = ?
+            ''', (account_id, today))
+            
+            if not existing:
+                self.perform_checkin(account_id)
+            else:
+                logger.info(f"Account {account['name']} already checked in today, skipping")
+                
+        except Exception as e:
+            logger.error(f"Error in delayed checkin for account {account_id}: {e}")
     
     def perform_checkin(self, account_id):
         """Perform check-in for an account"""
@@ -680,10 +856,6 @@ class CheckinScheduler:
             account = db.fetchone('SELECT * FROM accounts WHERE id = ?', (account_id,))
             if not account or not account.get('enabled'):
                 return
-            
-            # Add random delay
-            delay = random.randint(30, 60)
-            time.sleep(delay)
             
             # Parse token data
             token_data = json.loads(account['token_data'])
@@ -700,17 +872,21 @@ class CheckinScheduler:
                 # Perform check-in
                 success, message = self.leaflow_checkin.perform_checkin(session, account['name'])
             
+            # 使用东八区时间记录
+            now = datetime.now(DEFAULT_TIMEZONE)
+            today = now.date()
+            
             # Record check-in result
             db.execute('''
                 INSERT INTO checkin_history (account_id, success, message, checkin_date)
                 VALUES (?, ?, ?, ?)
-            ''', (account_id, success, message, datetime.now().date()))
+            ''', (account_id, success, message, today))
             
             logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
             
             # Send notification
             notification_title = f"Leaflow Check-in Result - {account['name']}"
-            notification_content = f"Status: {'✅ Success' if success else '❌ Failed'}\nMessage: {message}"
+            notification_content = f"Status: {'✅ Success' if success else '❌ Failed'}\nMessage: {message}\nTime: {now.strftime('%Y-%m-%d %H:%M:%S')} (Beijing Time)"
             NotificationService.send_notification(notification_title, notification_content)
             
         except Exception as e:
@@ -779,12 +955,15 @@ def dashboard():
         total_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts')
         enabled_accounts = db.fetchone('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1')
         
-        today = datetime.now().date()
+        # 使用东八区时间获取今日日期
+        today = datetime.now(DEFAULT_TIMEZONE).date()
+        
+        # 只获取今日的签到记录
         today_checkins = db.fetchall('''
             SELECT a.name, ch.success, ch.message, ch.created_at
             FROM checkin_history ch
             JOIN accounts a ON ch.account_id = a.id
-            WHERE ch.checkin_date = ?
+            WHERE DATE(ch.checkin_date) = DATE(?)
             ORDER BY ch.created_at DESC
             LIMIT 20
         ''', (today,))
@@ -809,12 +988,65 @@ def dashboard():
         logger.error(f"Dashboard error: {e}")
         return jsonify({'error': 'Failed to load dashboard data'}), 500
 
+@app.route('/api/system/settings', methods=['GET'])
+@token_required
+def get_system_settings():
+    """Get system settings"""
+    try:
+        settings = db.fetchone('SELECT * FROM system_settings WHERE id = 1')
+        if settings:
+            return jsonify({
+                'check_interval': settings['check_interval']
+            })
+        else:
+            return jsonify({
+                'check_interval': 60
+            })
+    except Exception as e:
+        logger.error(f"Get system settings error: {e}")
+        return jsonify({'error': 'Failed to load settings'}), 500
+
+@app.route('/api/system/settings', methods=['PUT'])
+@token_required
+def update_system_settings():
+    """Update system settings"""
+    try:
+        data = request.get_json()
+        check_interval = int(data.get('check_interval', 60))
+        
+        # 限制检查间隔范围
+        if check_interval < 10:
+            check_interval = 10
+        elif check_interval > 3600:
+            check_interval = 3600
+        
+        db.execute('''
+            UPDATE system_settings SET check_interval = ? WHERE id = 1
+        ''', (check_interval,))
+        
+        # 更新调度器的检查间隔
+        scheduler.update_check_interval(check_interval)
+        
+        return jsonify({'message': 'System settings updated successfully'})
+    except Exception as e:
+        logger.error(f"Update system settings error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
+
 @app.route('/api/accounts', methods=['GET'])
 @token_required
 def get_accounts():
     """Get all accounts"""
     try:
-        accounts = db.fetchall('SELECT id, name, enabled, checkin_time, created_at FROM accounts')
+        accounts = db.fetchall('''
+            SELECT id, name, enabled, checkin_time_start, checkin_time_end, created_at 
+            FROM accounts
+        ''')
+        
+        # 兼容旧版本
+        for account in accounts:
+            if 'checkin_time' not in account:
+                account['checkin_time'] = account.get('checkin_time_start', '01:00')
+        
         return jsonify(accounts or [])
     except Exception as e:
         logger.error(f"Get accounts error: {e}")
@@ -828,7 +1060,8 @@ def add_account():
         data = request.get_json()
         name = data.get('name')
         cookie_input = data.get('token_data', data.get('cookie_data', ''))
-        checkin_time = data.get('checkin_time', '01:00')
+        checkin_time_start = data.get('checkin_time_start', '01:00')
+        checkin_time_end = data.get('checkin_time_end', '01:30')
         
         if not name or not cookie_input:
             return jsonify({'message': 'Name and cookie data are required'}), 400
@@ -840,11 +1073,10 @@ def add_account():
             token_data = cookie_input
         
         db.execute('''
-            INSERT INTO accounts (name, token_data, checkin_time)
-            VALUES (?, ?, ?)
-        ''', (name, json.dumps(token_data), checkin_time))
+            INSERT INTO accounts (name, token_data, checkin_time_start, checkin_time_end)
+            VALUES (?, ?, ?, ?)
+        ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end))
         
-        scheduler.schedule_checkins()
         return jsonify({'message': 'Account added successfully'})
         
     except ValueError as e:
@@ -867,9 +1099,24 @@ def update_account(account_id):
             updates.append('enabled = ?')
             params.append(1 if data['enabled'] else 0)
         
-        if 'checkin_time' in data:
-            updates.append('checkin_time = ?')
+        if 'checkin_time_start' in data:
+            updates.append('checkin_time_start = ?')
+            params.append(data['checkin_time_start'])
+        
+        if 'checkin_time_end' in data:
+            updates.append('checkin_time_end = ?')
+            params.append(data['checkin_time_end'])
+        
+        # 兼容旧版本的checkin_time
+        if 'checkin_time' in data and 'checkin_time_start' not in data:
+            updates.append('checkin_time_start = ?')
             params.append(data['checkin_time'])
+            # 自动设置结束时间为开始时间后30分钟
+            start_hour, start_min = data['checkin_time'].split(':')
+            end_min = (int(start_min) + 30) % 60
+            end_hour = (int(start_hour) + ((int(start_min) + 30) // 60)) % 24
+            updates.append('checkin_time_end = ?')
+            params.append(f"{end_hour:02d}:{end_min:02d}")
         
         if 'token_data' in data or 'cookie_data' in data:
             cookie_input = data.get('token_data', data.get('cookie_data', ''))
@@ -885,7 +1132,6 @@ def update_account(account_id):
             query = f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?"
             db.execute(query, params)
             
-            scheduler.schedule_checkins()
             return jsonify({'message': 'Account updated successfully'})
         
         return jsonify({'message': 'No updates provided'}), 400
@@ -901,10 +1147,34 @@ def delete_account(account_id):
     try:
         db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
         db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
-        scheduler.schedule_checkins()
         return jsonify({'message': 'Account deleted successfully'})
     except Exception as e:
         logger.error(f"Delete account error: {e}")
+        return jsonify({'message': f'Error: {str(e)}'}), 400
+
+@app.route('/api/checkin/clear', methods=['POST'])
+@token_required
+def clear_checkin_history():
+    """Clear checkin history"""
+    try:
+        data = request.get_json()
+        clear_type = data.get('type', 'today')
+        
+        if clear_type == 'today':
+            # 清空今日签到记录
+            today = datetime.now(DEFAULT_TIMEZONE).date()
+            db.execute('DELETE FROM checkin_history WHERE DATE(checkin_date) = DATE(?)', (today,))
+            message = 'Today\'s checkin history cleared'
+        elif clear_type == 'all':
+            # 清空所有签到记录
+            db.execute('DELETE FROM checkin_history')
+            message = 'All checkin history cleared'
+        else:
+            return jsonify({'message': 'Invalid clear type'}), 400
+        
+        return jsonify({'message': message})
+    except Exception as e:
+        logger.error(f"Clear checkin history error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
 @app.route('/api/notification', methods=['GET'])
@@ -919,7 +1189,6 @@ def get_notification_settings():
             settings['telegram_user_id'] = settings.get('telegram_user_id', '') or ''
             settings['wechat_webhook_key'] = settings.get('wechat_webhook_key', '') or ''
             
-            logger.info(f"Loaded notification settings: {settings}")
             return jsonify(settings)
         else:
             default_settings = {
@@ -940,7 +1209,6 @@ def update_notification_settings():
     """Update notification settings"""
     try:
         data = request.get_json()
-        logger.info(f"Updating notification settings with data: {data}")
         
         enabled = 1 if data.get('enabled', False) else 0
         telegram_bot_token = data.get('telegram_bot_token', '') or ''
@@ -962,7 +1230,6 @@ def update_notification_settings():
                 wechat_webhook_key,
                 datetime.now()
             ))
-            logger.info("Notification settings updated successfully")
         else:
             db.execute('''
                 INSERT INTO notification_settings 
@@ -974,10 +1241,6 @@ def update_notification_settings():
                 telegram_user_id,
                 wechat_webhook_key
             ))
-            logger.info("Notification settings created successfully")
-        
-        updated_settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
-        logger.info(f"Verified settings after update: {updated_settings}")
         
         return jsonify({'message': 'Notification settings updated successfully'})
     except Exception as e:
@@ -1009,7 +1272,7 @@ def test_notification():
         logger.error(f"Test notification error: {e}")
         return jsonify({'message': f'Error: {str(e)}'}), 400
 
-# HTML Template (keeping the original with minor fixes)
+# HTML Template with improved time range support
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1058,6 +1321,26 @@ HTML_TEMPLATE = '''
             color: #555; 
             font-weight: 500;
         }
+        
+        /* 修复复选框对齐问题 */
+        .form-group.checkbox-group {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .form-group.checkbox-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 8px;
+        }
+        
+        .form-group.checkbox-group label {
+            display: flex;
+            align-items: center;
+            margin-bottom: 0;
+            cursor: pointer;
+        }
+        
         .form-group input, .form-group textarea, .form-group select { 
             width: 100%; 
             padding: 12px; 
@@ -1070,6 +1353,22 @@ HTML_TEMPLATE = '''
             border-color: #667eea;
             outline: none;
             box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        /* Time range input group */
+        .time-range-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .time-range-group input {
+            flex: 1;
+        }
+        
+        .time-range-group span {
+            color: #718096;
+            font-weight: 500;
         }
         
         /* Button Styles */
@@ -1116,6 +1415,12 @@ HTML_TEMPLATE = '''
         }
         .btn-info:hover {
             box-shadow: 0 5px 15px rgba(66, 153, 225, 0.4);
+        }
+        .btn-warning {
+            background: linear-gradient(135deg, #ed8936, #dd6b20);
+        }
+        .btn-warning:hover {
+            box-shadow: 0 5px 15px rgba(237, 137, 54, 0.4);
         }
         
         /* Dashboard Styles */
@@ -1210,6 +1515,12 @@ HTML_TEMPLATE = '''
             font-size: 20px;
             display: flex;
             align-items: center;
+            gap: 10px;
+        }
+        
+        /* Button group for history section */
+        .button-group {
+            display: flex;
             gap: 10px;
         }
         
@@ -1434,6 +1745,28 @@ HTML_TEMPLATE = '''
             color: #718096;
             margin-top: 5px;
         }
+        
+        /* Time zone info */
+        .timezone-info {
+            font-size: 12px;
+            color: #718096;
+            margin-top: 5px;
+        }
+        
+        /* Interval input */
+        .interval-input-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .interval-input-group input {
+            width: 100px;
+        }
+        
+        .interval-input-group span {
+            color: #718096;
+        }
     </style>
 </head>
 <body>
@@ -1491,7 +1824,13 @@ HTML_TEMPLATE = '''
             </div>
 
             <div class="section">
-                <h2>📅 今日签到记录</h2>
+                <div class="section-header">
+                    <h2>📅 今日签到记录</h2>
+                    <div class="button-group">
+                        <button class="btn btn-warning btn-sm" onclick="clearCheckinHistory('today')">清空今日记录</button>
+                        <button class="btn btn-danger btn-sm" onclick="clearCheckinHistory('all')">清空所有记录</button>
+                    </div>
+                </div>
                 <div class="table-wrapper">
                     <table class="table">
                         <thead>
@@ -1524,7 +1863,7 @@ HTML_TEMPLATE = '''
                             <tr>
                                 <th>名称</th>
                                 <th>状态</th>
-                                <th>签到时间</th>
+                                <th>签到时间段</th>
                                 <th>操作</th>
                             </tr>
                         </thead>
@@ -1541,10 +1880,25 @@ HTML_TEMPLATE = '''
 
             <div class="section">
                 <div class="section-header">
+                    <h2>⚙️ 系统设置</h2>
+                </div>
+                <div class="form-group">
+                    <label>检查间隔</label>
+                    <div class="interval-input-group">
+                        <input type="number" id="checkInterval" min="10" max="3600" value="60">
+                        <span>秒（10-3600秒）</span>
+                        <button class="btn btn-sm" onclick="saveSystemSettings()">保存</button>
+                    </div>
+                    <div class="timezone-info">系统会按此间隔检查是否有账号需要签到</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
                     <h2>🔔 通知设置</h2>
                     <button class="btn btn-info btn-sm" onclick="testNotification()">测试通知</button>
                 </div>
-                <div class="form-group">
+                <div class="form-group checkbox-group">
                     <label>
                         <input type="checkbox" id="notifyEnabled"> 
                         <span>启用通知</span>
@@ -1580,8 +1934,13 @@ HTML_TEMPLATE = '''
                     <input type="text" id="accountName" required>
                 </div>
                 <div class="form-group">
-                    <label>签到时间</label>
-                    <input type="time" id="checkinTime" value="01:00" required>
+                    <label>签到时间段</label>
+                    <div class="time-range-group">
+                        <input type="time" id="checkinTimeStart" value="01:00" required>
+                        <span>至</span>
+                        <input type="time" id="checkinTimeEnd" value="01:30" required>
+                    </div>
+                    <div class="timezone-info">时间为北京时间 (UTC+8)，系统会在此时间段内随机签到</div>
                 </div>
                 <div class="form-group">
                     <label>Cookie 数据</label>
@@ -1660,6 +2019,7 @@ HTML_TEMPLATE = '''
                     
                     loadDashboard();
                     loadAccounts();
+                    loadSystemSettings();
                     loadNotificationSettings();
                 } else {
                     showLoginError(data.message || '用户名或密码错误');
@@ -1699,6 +2059,7 @@ HTML_TEMPLATE = '''
                         document.getElementById('dashboard').style.display = 'block';
                         loadDashboard();
                         loadAccounts();
+                        loadSystemSettings();
                         loadNotificationSettings();
                     } else {
                         localStorage.removeItem('authToken');
@@ -1763,7 +2124,7 @@ HTML_TEMPLATE = '''
                         const tr = document.createElement('tr');
                         const statusText = checkin.success ? '成功' : '失败';
                         const statusClass = checkin.success ? 'badge-success' : 'badge-danger';
-                        const time = checkin.created_at ? new Date(checkin.created_at).toLocaleTimeString() : '-';
+                        const time = checkin.created_at ? new Date(checkin.created_at).toLocaleTimeString('zh-CN') : '-';
                         tr.innerHTML = `
                             <td>${checkin.name || '-'}</td>
                             <td><span class="badge ${statusClass}">${statusText}</span></td>
@@ -1773,7 +2134,7 @@ HTML_TEMPLATE = '''
                         tbody.appendChild(tr);
                     });
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #a0aec0;">暂无记录</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #a0aec0;">暂无今日签到记录</td></tr>';
                 }
             } catch (error) {
                 console.error('Failed to load dashboard:', error);
@@ -1791,6 +2152,9 @@ HTML_TEMPLATE = '''
                 if (accounts && accounts.length > 0) {
                     accounts.forEach(account => {
                         const tr = document.createElement('tr');
+                        const timeStart = account.checkin_time_start || '01:00';
+                        const timeEnd = account.checkin_time_end || '01:30';
+                        
                         tr.innerHTML = `
                             <td>${account.name}</td>
                             <td>
@@ -1800,7 +2164,12 @@ HTML_TEMPLATE = '''
                                 </label>
                             </td>
                             <td>
-                                <input type="time" value="${account.checkin_time}" onchange="updateCheckinTime(${account.id}, this.value)" style="border: 2px solid #e0e0e0; padding: 6px; border-radius: 6px;">
+                                <div class="time-range-group">
+                                    <input type="time" value="${timeStart}" onchange="updateCheckinTimeRange(${account.id}, this.value, '${timeEnd}')" style="border: 2px solid #e0e0e0; padding: 6px; border-radius: 6px;">
+                                    <span>至</span>
+                                    <input type="time" value="${timeEnd}" onchange="updateCheckinTimeRange(${account.id}, '${timeStart}', this.value)" style="border: 2px solid #e0e0e0; padding: 6px; border-radius: 6px;">
+                                </div>
+                                <span class="timezone-info" style="display: block; margin-top: 4px;">北京时间</span>
                             </td>
                             <td>
                                 <button class="btn btn-success btn-sm" onclick="manualCheckin(${account.id})">立即签到</button>
@@ -1814,6 +2183,37 @@ HTML_TEMPLATE = '''
                 }
             } catch (error) {
                 console.error('Failed to load accounts:', error);
+            }
+        }
+
+        async function loadSystemSettings() {
+            try {
+                const settings = await apiCall('/api/system/settings');
+                if (settings) {
+                    document.getElementById('checkInterval').value = settings.check_interval || 60;
+                }
+            } catch (error) {
+                console.error('Failed to load system settings:', error);
+            }
+        }
+
+        async function saveSystemSettings() {
+            try {
+                const checkInterval = parseInt(document.getElementById('checkInterval').value);
+                
+                if (checkInterval < 10 || checkInterval > 3600) {
+                    showToast('检查间隔必须在10-3600秒之间', 'error');
+                    return;
+                }
+                
+                await apiCall('/api/system/settings', {
+                    method: 'PUT',
+                    body: JSON.stringify({ check_interval: checkInterval })
+                });
+                
+                showToast('系统设置保存成功', 'success');
+            } catch (error) {
+                showToast('保存失败: ' + error.message, 'error');
             }
         }
 
@@ -1843,12 +2243,16 @@ HTML_TEMPLATE = '''
             }
         }
 
-        async function updateCheckinTime(id, checkin_time) {
+        async function updateCheckinTimeRange(id, start, end) {
             try {
                 await apiCall(`/api/accounts/${id}`, {
                     method: 'PUT',
-                    body: JSON.stringify({ checkin_time })
+                    body: JSON.stringify({ 
+                        checkin_time_start: start,
+                        checkin_time_end: end
+                    })
                 });
+                showToast('签到时间已更新', 'success');
             } catch (error) {
                 showToast('操作失败', 'error');
             }
@@ -1859,7 +2263,7 @@ HTML_TEMPLATE = '''
                 try {
                     await apiCall(`/api/checkin/manual/${id}`, { method: 'POST' });
                     showToast('签到任务已触发', 'success');
-                    setTimeout(loadDashboard, 2000);
+                    setTimeout(loadDashboard, 3000);
                 } catch (error) {
                     showToast('操作失败', 'error');
                 }
@@ -1874,6 +2278,22 @@ HTML_TEMPLATE = '''
                     loadAccounts();
                 } catch (error) {
                     showToast('操作失败', 'error');
+                }
+            }
+        }
+
+        async function clearCheckinHistory(type) {
+            const confirmMsg = type === 'today' ? '确定清空今日签到记录吗？' : '确定清空所有签到记录吗？此操作不可恢复！';
+            if (confirm(confirmMsg)) {
+                try {
+                    await apiCall('/api/checkin/clear', {
+                        method: 'POST',
+                        body: JSON.stringify({ type })
+                    });
+                    showToast(type === 'today' ? '今日记录已清空' : '所有记录已清空', 'success');
+                    loadDashboard();
+                } catch (error) {
+                    showToast('操作失败: ' + error.message, 'error');
                 }
             }
         }
@@ -1915,7 +2335,8 @@ HTML_TEMPLATE = '''
         function closeModal() {
             document.getElementById('addAccountModal').style.display = 'none';
             document.getElementById('accountName').value = '';
-            document.getElementById('checkinTime').value = '01:00';
+            document.getElementById('checkinTimeStart').value = '01:00';
+            document.getElementById('checkinTimeEnd').value = '01:30';
             document.getElementById('tokenData').value = '';
         }
 
@@ -1923,12 +2344,19 @@ HTML_TEMPLATE = '''
             try {
                 const account = {
                     name: document.getElementById('accountName').value,
-                    checkin_time: document.getElementById('checkinTime').value,
+                    checkin_time_start: document.getElementById('checkinTimeStart').value,
+                    checkin_time_end: document.getElementById('checkinTimeEnd').value,
                     token_data: document.getElementById('tokenData').value
                 };
 
                 if (!account.name || !account.token_data) {
                     showToast('请填写完整信息', 'error');
+                    return;
+                }
+                
+                // 验证时间范围
+                if (account.checkin_time_start === account.checkin_time_end) {
+                    showToast('开始时间和结束时间不能相同', 'error');
                     return;
                 }
 
@@ -1952,6 +2380,13 @@ HTML_TEMPLATE = '''
                 closeModal();
             }
         }
+
+        // 定期刷新仪表板
+        setInterval(() => {
+            if (authToken && document.getElementById('dashboard').style.display !== 'none') {
+                loadDashboard();
+            }
+        }, 60000); // 每分钟刷新一次
     </script>
 </body>
 </html>
@@ -1959,9 +2394,17 @@ HTML_TEMPLATE = '''
 
 if __name__ == '__main__':
     try:
+        # 安装pytz库（如果未安装）
+        try:
+            import pytz
+        except ImportError:
+            import subprocess
+            import sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "pytz"])
+            import pytz
+        
         # Start scheduler
         scheduler.start()
-        scheduler.schedule_checkins()
         
         # Log startup information
         logger.info(f"Starting Leaflow Control Panel on port {PORT}")
@@ -1969,6 +2412,8 @@ if __name__ == '__main__':
         if DB_TYPE == 'mysql':
             logger.info(f"MySQL connection: {DB_HOST}:{DB_PORT}/{DB_NAME} as {DB_USER}")
         logger.info(f"Admin username: {ADMIN_USERNAME}")
+        logger.info(f"Timezone: Asia/Shanghai (UTC+8)")
+        logger.info(f"Default check interval: {CHECK_INTERVAL} seconds")
         logger.info(f"Access the panel at: http://localhost:{PORT}")
         
         # Start Flask app
