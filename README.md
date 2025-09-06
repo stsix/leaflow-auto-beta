@@ -78,6 +78,7 @@ python app.py
    - JSON 格式：`{"cookies": {"key": "value"}}`
    - 分号分隔格式：`key1=value1; key2=value2`
    - 完整 Cookie 字符串
+  
 推荐账户cookie格式：
 ```
 {
