@@ -1,43 +1,34 @@
-# 第一阶段：构建
-FROM python:3.9-bullseye AS builder
+# Use official Python runtime as base image
+FROM python:3.9-slim
 
-WORKDIR /build
+# Set working directory
+WORKDIR /app
 
-# 安装构建依赖
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     python3-dev \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装Python包到用户目录
+# Copy project files
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
-
-# 第二阶段：运行
-FROM python:3.9-slim-bullseye
-
-WORKDIR /app
-
-# 安装运行时依赖（cryptography需要）
-RUN apt-get update && apt-get install -y \
-    libssl1.1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# 从构建阶段复制Python包
-COPY --from=builder /root/.local /root/.local
-
-# 复制应用文件
 COPY app.py .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create data directory
 RUN mkdir -p /app/data
 
-# 确保Python能找到包
-ENV PATH=/root/.local/bin:$PATH
-ENV PORT=8181 \
-    ADMIN_USERNAME=admin \
-    ADMIN_PASSWORD=admin123 \
-    JWT_SECRET_KEY=""
+# Set environment variable defaults
+ENV PORT=8181
+ENV ADMIN_USERNAME=admin
+ENV ADMIN_PASSWORD=admin123
+ENV JWT_SECRET_KEY=""
 
+# Expose port
 EXPOSE 8181
 
-CMD ["python", "app.py"]
+# Start control panel
+CMD ["python3", "app.py"]
