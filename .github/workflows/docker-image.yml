@@ -1,4 +1,4 @@
-name: 构建并推送 Docker 镜像到 GHCR
+name: 构建推送 Docker 镜像到 GHCR
 
 on:
   push:
