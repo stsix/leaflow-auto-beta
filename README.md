@@ -211,7 +211,7 @@ docker logs leaflow-auto
 
 ## 🙏 致谢
 
-- [LeafLow](https://leaflow.net) - 容器化部署平台
+- [Leaflow](https://leaflow.net) - 容器化部署平台
 - [leaflow-checkin](https://github.com/keggin-CHN/leaflow-checkin) - leaflow-checkin（本项目灵感基于该项目）
 
 ## 贡献指南
