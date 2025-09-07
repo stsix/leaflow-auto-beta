@@ -19,6 +19,7 @@ Leaflow 自动签到控制面板是一个基于 Web 的管理界面，用于自�
 ## 快速开始
 
 ### Docker 部署（推荐）
+Docker镜像最新版本：`ghcr.io/stsix/leaflow-auto-beta:20250907032301`
 
 ```bash
 # 拉取最新镜像
