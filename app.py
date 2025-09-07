@@ -200,7 +200,7 @@ class Database:
                     count = result[0] if isinstance(result, tuple) else result['cnt']
                     
                     if count == 0:
-                        cursor.execute('INSERT INTO system_settings (check_interval) VALUES (?)', (CHECK_INTERVAL,))
+                        cursor.execute('INSERT INTO system_settings (check_interval) VALUES (%s)', (CHECK_INTERVAL,))
                     
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS notification_settings (
