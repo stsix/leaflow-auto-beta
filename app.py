@@ -130,6 +130,18 @@ class AccountCache:
         with self.lock:
             self.cache = {}
             self.last_update = None
+    
+    def refresh_from_db(self, db):
+        """从数据库刷新缓存"""
+        try:
+            accounts_list = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+            if accounts_list:
+                self.update_cache(accounts_list)
+                logger.info(f"Account cache refreshed with {len(accounts_list)} accounts")
+            else:
+                self.invalidate()
+        except Exception as e:
+            logger.error(f"Error refreshing account cache: {e}")
 
 account_cache = AccountCache()
 
@@ -163,6 +175,13 @@ class DataCache:
                 self.cache.pop(key, None)
             else:
                 self.cache.clear()
+    
+    def invalidate_pattern(self, pattern):
+        """使匹配模式的缓存失效"""
+        with self.lock:
+            keys_to_remove = [k for k in self.cache.keys() if pattern in k]
+            for key in keys_to_remove:
+                self.cache.pop(key, None)
 
 # 初始化数据缓存
 data_cache = DataCache(cache_duration=60)  # 1分钟缓存
@@ -589,8 +608,8 @@ class NotificationService:
     def send_notification(title, content, account_name=None):
         """Send notification through configured channels"""
         try:
-            # 使用缓存获取通知设置
-            settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1', use_cache=True)
+            # 不使用缓存，直接从数据库获取最新设置
+            settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
             if not settings or not settings.get('enabled'):
                 logger.info("Notifications disabled")
                 return
@@ -1179,10 +1198,8 @@ class CheckinScheduler:
                     UPDATE accounts SET last_checkin_date = ?
                     WHERE id = ?
                 ''', (current_date, account_id))
-                # 使缓存失效
-                account_cache.invalidate()
-                # 清除相关的数据缓存
-                data_cache.invalidate()
+                # 刷新账户缓存
+                account_cache.refresh_from_db(db)
             
             logger.info(f"Check-in for {account['name']}: {'Success' if success else 'Failed'} - {message}")
             
@@ -1340,9 +1357,12 @@ def add_account():
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (name, json.dumps(token_data), checkin_time_start, checkin_time_end, check_interval, retry_count))
         
-        # 使缓存失效
-        account_cache.invalidate()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
         data_cache.invalidate()
+        
+        logger.info(f"Account '{name}' added and cache refreshed")
         
         return jsonify({'message': 'Account added successfully'})
         
@@ -1396,9 +1416,12 @@ def update_account(account_id):
             query = f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?"
             db.execute(query, params)
             
-            # 使缓存失效
-            account_cache.invalidate()
+            # 立即刷新账户缓存
+            account_cache.refresh_from_db(db)
+            # 清除相关数据缓存
             data_cache.invalidate()
+            
+            logger.info(f"Account {account_id} updated and cache refreshed")
             
             return jsonify({'message': 'Account updated successfully'})
         
@@ -1416,9 +1439,12 @@ def delete_account(account_id):
         db.execute('DELETE FROM checkin_history WHERE account_id = ?', (account_id,))
         db.execute('DELETE FROM accounts WHERE id = ?', (account_id,))
         
-        # 使缓存失效
-        account_cache.invalidate()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
         data_cache.invalidate()
+        
+        logger.info(f"Account {account_id} deleted and cache refreshed")
         
         return jsonify({'message': 'Account deleted successfully'})
     except Exception as e:
@@ -1448,9 +1474,12 @@ def clear_checkin_history():
         else:
             return jsonify({'message': 'Invalid clear type'}), 400
         
-        # 使缓存失效
-        account_cache.invalidate()
+        # 立即刷新账户缓存
+        account_cache.refresh_from_db(db)
+        # 清除相关数据缓存
         data_cache.invalidate()
+        
+        logger.info(f"Checkin history cleared ({clear_type}) and cache refreshed")
         
         return jsonify({'message': message})
     except Exception as e:
@@ -1462,8 +1491,8 @@ def clear_checkin_history():
 def get_notification_settings():
     """Get notification settings"""
     try:
-        # 使用缓存获取通知设置
-        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1', use_cache=True)
+        # 直接从数据库获取最新设置，不使用缓存
+        settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
         if settings:
             # 转换布尔值
             for key in ['enabled', 'telegram_enabled', 'wechat_enabled', 'wxpusher_enabled', 'dingtalk_enabled']:
@@ -1555,9 +1584,10 @@ def update_notification_settings():
             ))
             logger.info("Notification settings created successfully")
         
-        # 清除通知设置缓存
-        data_cache.invalidate()
+        # 清除所有通知相关缓存
+        data_cache.invalidate_pattern('notification')
         
+        # 立即从数据库获取最新设置并验证
         updated_settings = db.fetchone('SELECT * FROM notification_settings WHERE id = 1')
         logger.info(f"Verified settings after update: {updated_settings}")
         
@@ -2892,7 +2922,7 @@ if __name__ == '__main__':
         logger.info(f"Access the panel at: http://localhost:{PORT}")
         logger.info(f"Timezone: Asia/Shanghai (UTC+8)")
         logger.info(f"MySQL keepalive strategy: Check every 5 minutes, ping every 30 minutes")
-        logger.info(f"Data caching enabled: Account cache 5 minutes, General cache 1 minute")
+        logger.info(f"Data caching enabled: Account cache refreshes on data changes")
         
         # Start Flask app
         app.run(host='0.0.0.0', port=PORT, debug=False)
