@@ -27,6 +27,7 @@ import pytz
 import hmac
 import base64
 import urllib.parse
+import traceback
 
 # Configuration
 app = Flask(__name__)
@@ -116,7 +117,7 @@ class AccountCache:
             now = time.time()
             if force_refresh or not self.last_update or (now - self.last_update) > self.cache_duration:
                 return None
-            return self.cache.copy()
+            return list(self.cache.values())  # 返回列表而不是字典
     
     def update_cache(self, accounts):
         """更新缓存"""
@@ -175,6 +176,7 @@ class Database:
         self.last_actual_ping = time.time()  # 记录上次实际ping的时间
         self.ping_check_interval = 300  # 每5分钟检查一次
         self.ping_actual_interval = 1800  # 30分钟实际ping间隔
+        self.db_type = None  # 初始化db_type
         self.connect()
         self.init_tables()
         # 启动保活线程
@@ -432,10 +434,17 @@ class Database:
                         )
                     ''')
                 
-                # 初始化通知设置
+                # 初始化通知设置 - 修复这里
                 cursor.execute('SELECT COUNT(*) as cnt FROM notification_settings')
                 result = cursor.fetchone()
-                count = result[0] if isinstance(result, tuple) else (result['cnt'] if hasattr(result, '__getitem__') else 0)
+                
+                # 修复：正确处理不同数据库返回的结果
+                if self.db_type == 'mysql':
+                    # MySQL返回元组
+                    count = result[0] if result else 0
+                else:
+                    # SQLite返回Row对象
+                    count = result['cnt'] if result else 0
                 
                 if count == 0:
                     if self.db_type == 'mysql':
@@ -454,6 +463,7 @@ class Database:
                 
             except Exception as e:
                 logger.error(f"Error initializing tables: {e}")
+                logger.error(traceback.format_exc())
                 raise
     
     def execute(self, query, params=None, use_cache=False, cache_key=None):
@@ -1021,60 +1031,66 @@ class CheckinScheduler:
                 accounts = account_cache.get_accounts()
                 if accounts is None:
                     # 缓存失效，从数据库获取
-                    accounts = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
-                    if accounts:
-                        account_cache.update_cache(accounts)
-                        accounts = account_cache.cache.values()
+                    accounts_list = db.fetchall('SELECT * FROM accounts WHERE enabled = 1')
+                    if accounts_list:
+                        account_cache.update_cache(accounts_list)
+                        accounts = accounts_list  # 直接使用列表
+                    else:
+                        accounts = []
                 
                 for account in accounts:
-                    account_id = account['id']
-                    
-                    # 检查今天是否已经签到
-                    last_checkin_date = account.get('last_checkin_date')
-                    if last_checkin_date:
-                        if isinstance(last_checkin_date, str):
-                            last_checkin_date = datetime.strptime(last_checkin_date, '%Y-%m-%d').date()
-                        if last_checkin_date == current_date:
-                            continue  # 今天已经签到，跳过
-                    
-                    # 获取签到时间范围
-                    start_time_str = account.get('checkin_time_start', '06:30')
-                    end_time_str = account.get('checkin_time_end', '06:40')
-                    check_interval = account.get('check_interval', 60)
-                    
-                    # 解析时间
-                    start_hour, start_minute = map(int, start_time_str.split(':'))
-                    end_hour, end_minute = map(int, end_time_str.split(':'))
-                    
-                    # 创建今天的开始和结束时间
-                    start_time = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-                    end_time = now.replace(hour=end_hour, minute=end_minute, second=59, microsecond=999999)
-                    
-                    # 检查是否在签到时间范围内
-                    if start_time <= now <= end_time:
-                        # 检查是否需要执行签到
-                        task_key = f"{account_id}_{current_date}"
+                    try:
+                        account_id = account['id']
                         
-                        if task_key not in self.checkin_tasks:
-                            self.checkin_tasks[task_key] = {
-                                'last_check': None,
-                                'completed': False,
-                                'retry_count': 0
-                            }
+                        # 检查今天是否已经签到
+                        last_checkin_date = account.get('last_checkin_date')
+                        if last_checkin_date:
+                            if isinstance(last_checkin_date, str):
+                                last_checkin_date = datetime.strptime(last_checkin_date, '%Y-%m-%d').date()
+                            if last_checkin_date == current_date:
+                                continue  # 今天已经签到，跳过
                         
-                        task = self.checkin_tasks[task_key]
+                        # 获取签到时间范围
+                        start_time_str = account.get('checkin_time_start', '06:30')
+                        end_time_str = account.get('checkin_time_end', '06:40')
+                        check_interval = account.get('check_interval', 60)
                         
-                        # 如果还没完成签到，且距离上次检查超过了间隔时间
-                        if not task['completed']:
-                            if task['last_check'] is None or \
-                               (now - task['last_check']).total_seconds() >= check_interval:
-                                # 执行签到
-                                task['last_check'] = now
-                                threading.Thread(
-                                    target=self.perform_checkin_with_delay,
-                                    args=(account_id, task_key),
-                                    daemon=True
-                                ).start()
+                        # 解析时间
+                        start_hour, start_minute = map(int, start_time_str.split(':'))
+                        end_hour, end_minute = map(int, end_time_str.split(':'))
+                        
+                        # 创建今天的开始和结束时间
+                        start_time = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+                        end_time = now.replace(hour=end_hour, minute=end_minute, second=59, microsecond=999999)
+                        
+                        # 检查是否在签到时间范围内
+                        if start_time <= now <= end_time:
+                            # 检查是否需要执行签到
+                            task_key = f"{account_id}_{current_date}"
+                            
+                            if task_key not in self.checkin_tasks:
+                                self.checkin_tasks[task_key] = {
+                                    'last_check': None,
+                                    'completed': False,
+                                    'retry_count': 0
+                                }
+                            
+                            task = self.checkin_tasks[task_key]
+                            
+                            # 如果还没完成签到，且距离上次检查超过了间隔时间
+                            if not task['completed']:
+                                if task['last_check'] is None or \
+                                   (now - task['last_check']).total_seconds() >= check_interval:
+                                    # 执行签到
+                                    task['last_check'] = now
+                                    threading.Thread(
+                                        target=self.perform_checkin_with_delay,
+                                        args=(account_id, task_key),
+                                        daemon=True
+                                    ).start()
+                    except Exception as e:
+                        logger.error(f"Error processing account {account.get('id', 'unknown')}: {e}")
+                        continue
                 
                 # 清理过期的任务记录
                 expired_keys = []
@@ -1086,6 +1102,7 @@ class CheckinScheduler:
                 
             except Exception as e:
                 logger.error(f"Scheduler error: {e}")
+                logger.error(traceback.format_exc())
             
             # 等待一段时间再检查
             time.sleep(30)  # 每30秒检查一次
@@ -1106,6 +1123,7 @@ class CheckinScheduler:
                 
         except Exception as e:
             logger.error(f"Checkin with delay error: {e}")
+            logger.error(traceback.format_exc())
     
     def perform_checkin(self, account_id, retry_attempt=0):
         """Perform check-in for an account with retry mechanism"""
@@ -1178,6 +1196,7 @@ class CheckinScheduler:
             
         except Exception as e:
             logger.error(f"Check-in error for account {account_id}: {e}")
+            logger.error(traceback.format_exc())
             
             # Send error notification
             try:
